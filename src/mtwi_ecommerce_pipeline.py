@@ -1,10 +1,10 @@
-"""MTWI → ecommerce pipeline (see agent.md for architecture, README.md for runbook).
+"""MTWI → ecommerce pipeline (see agent.md for architecture, src/README.md for runbook).
 
 Steps: text removal (local and/or model) → optional harmonize → quality (local and/or model) →
 vision understanding → bilingual copy → optional extra same-product images.
 
 Do not duplicate long usage blocks here; run `python src/mtwi_ecommerce_pipeline.py --help`
-or `./scripts/run_one_deliverable_example.sh` (see README.md).
+or `./scripts/run_one_deliverable_example.sh` (see src/README.md).
 """
 
 from __future__ import annotations

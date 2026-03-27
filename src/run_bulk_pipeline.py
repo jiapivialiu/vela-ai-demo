@@ -2,7 +2,7 @@
 
 Config keys mirror CLI flags (see configs/bulk_run.yaml). Omitted keys use defaults in
 `build_pipeline_cmd` (e.g. eraser/restore model IDs only matter for model erase/restore).
-Operator docs: README.md (bulk section).
+Operator docs: src/README.md (bulk section).
 
 Usage:
     python src/run_bulk_pipeline.py --config configs/bulk_run.yaml

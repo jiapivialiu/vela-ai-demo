@@ -4,6 +4,9 @@ Brief record of what changed and what was verified to work.
 
 ## 2026-03-28
 
+- **Docs split**: root `README.md` = Streamlit only (venv, API key, `streamlit run`); training/bulk/eval/sharing table → `src/README.md`. Cross-links updated (`agent.md`, `PROMPT_TUNING_NOTES.md`, configs, `run_bulk_pipeline` docstring, shell script comment).
+- **README**: added “分享给别人试用” table (repo vs Mock vs LAN vs tunnel vs Streamlit Cloud).
+- **Streamlit UI**: added root `streamlit_app.py` — image + MTWI txt upload, sidebar options (mock/API key, mask mode, harmonize, extra images), run pipeline, **in-page preview** (images + EN/FR markdown + manifest/samples expanders), ZIP download; `outputs/streamlit_runs/` gitignored; `requirements.txt` includes `streamlit`.
 - **README simplified**: single table of existing scripts/configs; removed long duplicate sections; `bash scripts/...` for one-item demo; fixed narrative (YAML keys described in prose, not CLI-style `erase-strategy`).
 - **Repo hygiene (gen + eval path only)**:
   - Moved single-item shell demo to `scripts/run_one_deliverable_example.sh` (removed misplaced copy under `src/`).

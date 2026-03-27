@@ -1,4 +1,4 @@
-# bulk_run_smoke.yaml — mock smoke (limit 3, no harmonize / no extra images). Contrast: bulk_run.yaml.
+# bulk_run_smoke.yaml — mock smoke (limit 3, no harmonize / no extra images). Contrast: bulk_run.yaml. Runbook: src/README.md.
 
 run_name: mtwi_bulk_smoke
 output_root: outputs/runs

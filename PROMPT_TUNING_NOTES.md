@@ -1,6 +1,6 @@
 ## MTWI 电商 Agent — Prompt 收敛经验
 
-> **与 README 的分工**：安装、默认命令、输出目录、评估方式只维护在 [README.md](README.md)。**本文件只写 prompt 约束与句式**，不在其他 markdown 里复制同一段说明。
+> **与文档的分工**：安装、批处理命令、输出目录、评估方式见 [src/README.md](src/README.md)；本地 Streamlit 与 API Key 见根 [README.md](README.md)。**本文件只写 prompt 约束与句式**。
 
 目标：**只做“去字/去水印 + 画质提升 + 保守理解 + 双语文案”**，避免模型自由发挥导致商品不真实。
 

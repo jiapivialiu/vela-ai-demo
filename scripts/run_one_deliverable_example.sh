@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Single-product deliverable demo (data/demo_one/). Full context: README.md § 「单商品交付物」.
+# Single-product deliverable demo (data/demo_one/). Full context: src/README.md.
 # Flow: local erase + local quality + EN/FR copy + 3 extra images + outputs under outputs/deliverables_demo_one/.
 # Requires: .venv, pip install -r requirements.txt, GMI_API_KEY (or credentials.json for this script only).
 set -euo pipefail

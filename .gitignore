@@ -13,3 +13,6 @@ credentials.json
 
 # large training set
 data/mtwi_train/
+
+# Streamlit UI runs
+outputs/streamlit_runs/

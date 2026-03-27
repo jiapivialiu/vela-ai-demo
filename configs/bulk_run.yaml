@@ -1,5 +1,5 @@
 # bulk_run.yaml — production-oriented batch template (real APIs, default limit 200).
-# Smoke / CI: bulk_run_smoke.yaml. Runbook: README.md § 批量可复现.
+# Smoke / CI: bulk_run_smoke.yaml. Runbook: src/README.md.
 # Optional top-level env map merged into process env, e.g. env: { GMI_API_KEY: "..." }
 
 run_name: mtwi_bulk

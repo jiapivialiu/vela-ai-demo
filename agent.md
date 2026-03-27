@@ -1,4 +1,4 @@
-> **说明**：下列为**架构示意**。默认模型名、路径与开关以 [README.md](README.md) 与 `python src/mtwi_ecommerce_pipeline.py --help` 为准（例如视觉理解常用账户内的 vision 模型，不一定与旧版 Gemini 示意一致）。
+> **说明**：下列为**架构示意**。默认模型名、路径与开关以 [src/README.md](src/README.md) 与 `python src/mtwi_ecommerce_pipeline.py --help` 为准（例如视觉理解常用账户内的 vision 模型，不一定与旧版 Gemini 示意一致）。
 
 ```
 ┌─────────────────────────────────────────────────────────────┐

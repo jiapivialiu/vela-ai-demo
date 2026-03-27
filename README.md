@@ -1,93 +1,42 @@
-# Vela AI MTWI Ecommerce Demo
+# Vela AI Agent — 本地 Streamlit 网页
 
-MTWI 图 + 四边形文本框 → 去字/提质 → 视觉理解 → 加拿大英语 + 法语文案 → 可选同商品扩展图。**批量跑**会再接图像评估、文案评估和稳定性基线输出。
+在浏览器里上传**商品图**和 **MTWI 格式**的文本框坐标（每行 `X1,Y1,…,X4,Y4,文本`），一键跑通修图与英法文案，并可在页面预览、打包下载。
 
-## 脚本与文档（当前仓库）
+> 命令行批处理、数据集目录、评估脚本等见 **[src/README.md](src/README.md)**。
 
-| 路径 | 作用 |
-|------|------|
-| `src/mtwi_ecommerce_pipeline.py` | 主链路 CLI |
-| `src/run_bulk_pipeline.py` | 批量：pipeline → deliverables → 双评估 |
-| `src/eval_image_quality.py` / `src/eval_copy_quality.py` | 评估（也可单独跑） |
-| `scripts/run_one_deliverable_example.sh` | 单商品示例（`data/demo_one/` → `outputs/deliverables_demo_one/`） |
-| `configs/bulk_run.yaml` / `configs/bulk_run_smoke.yaml` | 批量配置（生产 / mock 冒烟） |
+## 1. 环境
 
-架构示意：[agent.md](agent.md)。Prompt 约束：[PROMPT_TUNING_NOTES.md](PROMPT_TUNING_NOTES.md)。变更记录：[DEV_LOG.md](DEV_LOG.md)。
-
-## 数据
-
-`txt_train` 每行：`X1,Y1,X2,Y2,X3,Y3,X4,Y4,文本`（四顶点 + 框内文本）。
-
-## 环境
+在**仓库根目录**执行：
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate
+# Windows: .venv\Scripts\activate
+
 pip install -r requirements.txt
-export GMI_API_KEY="<your-api-key>"   # 非 --mock 必需
 ```
 
-可选：仓库根目录 `credentials.json`（已在 `.gitignore`，勿提交）。`run_one_deliverable_example.sh` 在未导出变量时会读取其中的 `api_key`。
+## 2. 配置 API Key（真实模型）
 
-## 怎么跑
+调用 GMI 接口需要 **API Key**（与用量/计费相关）。任选其一：
 
-### 单商品交付物示例
+| 方式 | 做法 |
+|------|------|
+| **环境变量（推荐）** | 启动前执行：`export GMI_API_KEY="你的密钥"`（Windows 可用 `set` / 系统环境变量） |
+| **网页侧栏** | 运行应用后，在左侧 **GMI API Key** 密码框粘贴；仅当前浏览器会话内生效 |
+
+**注意**：不要把真实 Key 写进代码或提交到 Git。可选在本机使用根目录 `credentials.json`（需已在 `.gitignore`），但 **Streamlit 页面默认只认环境变量与侧栏**；若要用文件，请先 `export GMI_API_KEY="$(python -c "import json;print(json.load(open('credentials.json'))['api_key'])")"` 再启动。
+
+不需要 Key、只想试界面与流程时：侧栏勾选 **Mock 模式**（不调外部 API，结果为占位逻辑）。
+
+## 3. 启动本地网页
 
 ```bash
-bash scripts/run_one_deliverable_example.sh
+streamlit run streamlit_app.py
 ```
 
-### 主脚本（调参 / 自定义数据路径）
+默认浏览器打开 **http://localhost:8501**。
 
-```bash
-python src/mtwi_ecommerce_pipeline.py --help
+- 同一 WiFi 给他人临时访问：`streamlit run streamlit_app.py --server.address 0.0.0.0 --server.port 8501`，对方访问 `http://<你的电脑局域网 IP>:8501`（仍使用你本机的 Key）。
 
-python src/mtwi_ecommerce_pipeline.py --limit 3 \
-  --erase-strategy local --quality-strategy local \
-  --no-harmonize-after-erase --disable-restore \
-  --mask-mode overlay --generate-additional-images --additional-image-count 3 \
-  --vision-model "openai/gpt-4o" --qwen-model "Qwen/Qwen3.5-27B" \
-  --fallback-text-model "openai/gpt-4o-mini" \
-  --image-output-dir outputs/mtwi_images \
-  --export-deliverables --deliverable-dir outputs/deliverables
-```
-
-### 批量可复现
-
-```bash
-python src/run_bulk_pipeline.py --config configs/bulk_run.yaml
-# 冒烟：configs/bulk_run_smoke.yaml
-```
-
-配置里**没写**的字段由 `run_bulk_pipeline.py` 使用内置默认值。若改用 **model** 去字或启用模型 restore，在 YAML 的 `pipeline` 下自行增加 `eraser_model`、`restore_model` 等键即可覆盖。
-
-每次批量运行目录：`outputs/runs/<run_id>/`（含 `run.log`、`mtwi_ecommerce_samples.yaml`、`deliverables/`、`*_metrics.*`、`stability_baseline.*`）。
-
-### 固定 N 条（例如 100）
-
-复制 `configs/bulk_run.yaml` 为新文件，把其中 `pipeline.limit` 改成 `100`，再 `--config` 指向该文件即可。
-
-## 输出提要
-
-- **聚合 YAML**：单次默认 `outputs/mtwi_ecommerce_samples.yaml`；批量在对应 `run_id` 目录下。
-- **交付包**：每商品子目录：`product_image.png`、`description_en.md`、`description_fr.md`、`manifest.json`，可选 `product_image_extra_*.png`；根目录 `deliverables_index.csv`。
-
-## 单独跑评估
-
-将 `--samples-yaml` 换成你的产物路径（批量 run 下为 `outputs/runs/<run_id>/mtwi_ecommerce_samples.yaml`）：
-
-```bash
-python src/eval_image_quality.py \
-  --samples-yaml outputs/mtwi_ecommerce_samples.yaml \
-  --output-csv outputs/mtwi_image_metrics.csv \
-  --output-md outputs/mtwi_image_metrics.md
-
-python src/eval_copy_quality.py \
-  --samples-yaml outputs/mtwi_ecommerce_samples.yaml \
-  --output-csv outputs/mtwi_copy_metrics.csv \
-  --output-md outputs/mtwi_copy_metrics.md
-```
-
-## 看板
-
-- 日志：`tail -f outputs/runs/<run_id>/run.log`
-- 滚动基线：同目录 `stability_baseline.md`（刷新间隔由配置里 `stability_update_every` 控制）
+运行产物目录：`outputs/streamlit_runs/`（已 `.gitignore`，无需手删）。
