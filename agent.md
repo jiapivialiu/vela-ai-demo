@@ -1,67 +1,41 @@
-```mermaid
-graph TB
-    subgraph Input[输入层]
-        A[商品中文描述<br/>Product Description]
-        B[商品图片<br/>Product Image URL]
-    end
+> **说明**：下列为**架构示意**。默认模型名、路径与开关以 [README.md](README.md) 与 `python src/mtwi_ecommerce_pipeline.py --help` 为准（例如视觉理解常用账户内的 vision 模型，不一定与旧版 Gemini 示意一致）。
 
-    subgraph Orchestrator[编排器 EcomLocalizationOrchestrator]
-        direction TB
-        C[统一调度 & 数据传递]
-    end
-
-    subgraph Agents[多模型协作层]
-        direction LR
-        D[ProductUnderstandingAgent<br/>商品理解 Agent]
-        E[TitleGeneratorAgent<br/>标题生成 Agent]
-        F[SpecsExtractorAgent<br/>规格提取 Agent]
-        G[MarketingCopyAgent<br/>营销文案 Agent]
-        H[MarketingImageAgent<br/>营销图片 Agent]
-    end
-
-    subgraph Models[模型层 GMI Cloud]
-        I[openai/gpt-4o<br/>多模态理解]
-        J[anthropic/claude-3.5-sonnet<br/>英文生成]
-        K[openai/gpt-4o-mini<br/>结构化提取]
-        L[google/gemini-2.0-flash<br/>图像理解]
-    end
-
-    subgraph Output[输出层]
-        M[英文标题<br/>Titles]
-        N[规格参数表<br/>Specs]
-        O[营销卖点<br/>Bullet Points]
-        P[营销图片Prompt<br/>Image Prompt]
-        Q[Amazon Listing<br/>完整格式]
-    end
-
-    A --> C
-    B --> C
-    C --> D
-    C --> E
-    C --> F
-    C --> G
-    C --> H
-
-    D --> I
-    E --> J
-    F --> K
-    G --> J
-    H --> L
-
-    D --> M
-    D --> N
-    E --> M
-    F --> N
-    G --> O
-    G --> Q
-    H --> P
-    O --> Q
-    N --> Q
-    M --> Q
-
-    style Input fill:#e1f5fe
-    style Orchestrator fill:#fff3e0
-    style Agents fill:#f3e5f5
-    style Models fill:#e8f5e9
-    style Output fill:#fff8e1
 ```
+┌─────────────────────────────────────────────────────────────┐
+│  输入：MTWI 原始图片 + 文本框标注（四边形顶点坐标）            │
+└─────────────────────────┬───────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│  步骤1：文字擦除                                             │
+│  实现：本地按框修复 和/或 图像编辑模型（见 --erase-strategy） │
+│  输入：原图 + 可选 mask（由标注生成，受 --mask-mode 控制）     │
+│  输出：去除目标文字区域后的商品图                             │
+└─────────────────────────┬───────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│  步骤2：画质与观感（可选）                                    │
+│  实现：本地增强 和/或 模型 restore；可选 harmonize Pass        │
+│  输入：步骤1 输出                                             │
+│  输出：更适合电商主图的版本                                   │
+└─────────────────────────┬───────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│  步骤3：多模态理解（结构化商品属性）                          │
+│  模型：--vision-model（须支持图像输入）                      │
+│  输入：原图（或策略上含字的图）+ 清洗后的 OCR 文本提示         │
+│  输出：品类、材质、卖点等结构化 JSON                           │
+└─────────────────────────┬───────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│  步骤4：多语言文案                                           │
+│  模型：--qwen-model，失败时 --fallback-text-model             │
+│  输入：步骤3 结构化属性                                      │
+│  输出：加拿大英语 / 加拿大法语 listing 字段                   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+可选：**同商品多张营销图**（基于修图结果，`--generate-additional-images`）。细节见 README。

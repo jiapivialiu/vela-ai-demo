@@ -1,0 +1,29 @@
+# bulk_run_smoke.yaml — mock smoke (limit 3, no harmonize / no extra images). Contrast: bulk_run.yaml.
+
+run_name: mtwi_bulk_smoke
+output_root: outputs/runs
+
+pipeline:
+  txt_dir: data/mtwi_train/txt_train
+  image_dir: data/mtwi_train/image_train
+  input_images_glob: "*.jpg*"
+  limit: 3
+
+  mask_mode: overlay
+  erase_strategy: local
+  quality_strategy: local
+  disable_erase: false
+  disable_restore: true
+  no_mask: false
+  harmonize_after_erase: false
+  mock: true
+
+  vision_model: openai/gpt-4o
+  qwen_model: Qwen/Qwen3.5-27B
+  fallback_text_model: openai/gpt-4o-mini
+  generate_additional_images: false
+  max_attempts: 2
+  stability_update_every: 1
+
+evaluation:
+  diff_threshold: 12

@@ -10,3 +10,6 @@ credentials.json
 
 # macOS metadata
 .DS_Store
+
+# large training set
+data/mtwi_train/

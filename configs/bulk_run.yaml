@@ -1,0 +1,34 @@
+# bulk_run.yaml — production-oriented batch template (real APIs, default limit 200).
+# Smoke / CI: bulk_run_smoke.yaml. Runbook: README.md § 批量可复现.
+# Optional top-level env map merged into process env, e.g. env: { GMI_API_KEY: "..." }
+
+run_name: mtwi_bulk
+output_root: outputs/runs
+
+pipeline:
+  txt_dir: data/mtwi_train/txt_train
+  image_dir: data/mtwi_train/image_train
+  input_images_glob: "*.jpg*"
+  limit: 200
+
+  mask_mode: overlay
+  erase_strategy: local
+  quality_strategy: local
+  disable_erase: false
+  disable_restore: true
+  no_mask: false
+  harmonize_after_erase: true
+  harmonize_model: bria-fibo-edit
+  mock: false
+
+  vision_model: openai/gpt-4o
+  qwen_model: Qwen/Qwen3.5-27B
+  fallback_text_model: openai/gpt-4o-mini
+  generate_additional_images: true
+  additional_image_model: seedream-5.0-lite
+  additional_image_count: 3
+  max_attempts: 2
+  stability_update_every: 100
+
+evaluation:
+  diff_threshold: 12
