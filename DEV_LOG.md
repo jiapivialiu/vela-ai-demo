@@ -4,6 +4,9 @@ Brief record of what changed and what was verified to work.
 
 ## 2026-03-27 (verified live)
 
+- **Bilingual localization upgrade**: updated `src/press_on_nails_pipeline.py` to generate both `canadian_english` and `canadian_french` copy blocks per product (title, bullet points, description, CTA).
+- **Prompt/output schema update**: revised LLM JSON contract to explicitly request and parse dual-language Canadian-market outputs.
+- **Docs refresh**: updated `README.md` examples and wording from English-only to English+French output.
 - **Credentials safety**: added `credentials.json` to `.gitignore` (avoid accidental commits).
 - **LLM smoke test**: `curl` to `POST https://api.gmi-serving.com/v1/chat/completions` works with streaming.
 - **Image smoke test**: Request Queue `POST https://console.gmicloud.ai/api/v1/ie/requestqueue/apikey/requests` works and returns a `media_urls[].url`.

@@ -9,7 +9,7 @@ Vela AI starts here.
 
 * **示例品类**：穿戴甲（Press-on Nails）
 * **输入**：中文商品描述 + 商品图片
-* **输出**：英文商品标题、文案、导购文本 + 模特佩戴图
+* **输出**：加拿大英语 + 加拿大法语商品标题、文案、导购文本 + 模特佩戴图
 
 ---
 
@@ -106,12 +106,12 @@ pip install requests streamlit gmi-sdk
 streamlit run app.py
 ```
 
-5. 输入中文商品信息，即可生成英文文案 + 多模态展示图片
+5. 输入中文商品信息，即可生成加拿大英语/法语文案 + 多模态展示图片
 
 ### 🧪 本地 Press-on Nails Pipeline（CLI）
 
 本仓库还提供了一个最小可运行的 CLI Pipeline，用于直接从 `data/press_on_nails.csv`
-读取中文非结构化商品信息，并生成结构化英文输出：
+读取中文非结构化商品信息，并生成结构化双语（加拿大英语 + 加拿大法语）输出：
 
 **依赖安装（建议在虚拟环境中）**
 
@@ -133,7 +133,7 @@ source .venv/bin/activate
 python src/press_on_nails_pipeline.py --limit 3 --mock
 ```
 
-这会读取 `data/press_on_nails.csv`，解析中文描述，生成示例英文文案，并写入：
+这会读取 `data/press_on_nails.csv`，解析中文描述，生成示例双语文案，并写入：
 
 - `outputs/press_on_nails_samples.yaml`
 
@@ -156,10 +156,16 @@ python src/press_on_nails_pipeline.py --limit 3
 
 ```yaml
 - product_id: "1001"
-   localized_title: "..."          # LLM 生成的英文标题
-   bullet_points: ["...", ...]     # 3–4 条英文卖点
-   description: "..."             # 面向加拿大用户的英文描述
-   call_to_action: "..."          # 引导下单的 CTA 文案
+   canadian_english:
+      localized_title: "..."       # LLM 生成的加拿大英语标题
+      bullet_points: ["...", ...]  # 3–4 条加拿大英语卖点
+      description: "..."           # 面向加拿大用户的英语描述
+      call_to_action: "..."        # 英语 CTA 文案
+   canadian_french:
+      localized_title: "..."       # LLM 生成的加拿大法语标题
+      bullet_points: ["...", ...]  # 3–4 条加拿大法语卖点
+      description: "..."           # 面向加拿大用户的法语描述
+      call_to_action: "..."        # 法语 CTA 文案
    image_prompt: "..."            # 可直接喂给图像模型的英文 prompt
    source_summary:                  # 从中文源数据解析出的结构化属性
       brand: "海鲤"

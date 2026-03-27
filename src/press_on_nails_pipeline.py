@@ -81,12 +81,18 @@ class StructuredProduct:
 
 
 @dataclass
-class LocalizedMaterial:
-    product_id: str
+class LocalizedCopy:
     localized_title: str
     bullet_points: List[str]
     description: str
     call_to_action: str
+
+
+@dataclass
+class LocalizedMaterial:
+    product_id: str
+    canadian_english: LocalizedCopy
+    canadian_french: LocalizedCopy
     image_prompt: str
     source_summary: Dict[str, str]
     # Local path of the generated image (if any)
@@ -151,37 +157,55 @@ class GMICloudLLMClient:
 
         return LocalizedMaterial(
             product_id=product.product_id,
-            localized_title=content.get("title", f"Localized Title for {product.product_id}"),
-            bullet_points=content.get("bullet_points", []),
-            description=content.get("description", ""),
-            call_to_action=content.get("call_to_action", ""),
+            canadian_english=self._build_localized_copy(content, "canadian_english", product.product_id, "English"),
+            canadian_french=self._build_localized_copy(content, "canadian_french", product.product_id, "French"),
             image_prompt=build_image_prompt(product),
             source_summary=product.attributes,
         )
 
     def _generate_mock_copy(self, product: StructuredProduct) -> LocalizedMaterial:
         """Generates deterministic marketing copy for offline testing."""
-        brand = product.attributes.get("brand", "Vela Nails")
-        style_tags = product.style_tags or ["modern", "chic"]
-        pattern = product.attributes.get("pattern", "minimalist art")
+        brand = "Vela Nails"
+        style_tags = ["modern", "chic"]
+        pattern = "minimalist art"
 
-        localized_title = f"Mock: {brand} Press-On Nails | {' & '.join(s.title() for s in style_tags)} Style"
-        bullet_points = [
+        localized_title_en = f"Mock: {brand} Press-On Nails | {' & '.join(s.title() for s in style_tags)} Style"
+        bullet_points_en = [
             f"Mock: Embrace the {style_tags[0]} trend with these easy-to-apply nails.",
             "Mock: Includes 24 nails in 12 sizes for a perfect fit.",
             f"Mock: Features a durable, high-gloss finish with a {pattern} design.",
         ]
-        description = (
+        description_en = (
             "Mock: Get a flawless, salon-quality manicure in minutes. Our press-on nails are designed "
             "for long-lasting wear and effortless style, perfect for any occasion in Canada."
         )
-        call_to_action = "Mock: Add to cart and discover your new favourite look!"
+        call_to_action_en = "Mock: Add to cart and discover your new favourite look!"
+
+        localized_title_fr = f"Maquette : Ongles autocollants {brand} | Style {' et '.join(s.title() for s in style_tags)}"
+        bullet_points_fr = [
+            f"Maquette : Adoptez la tendance {style_tags[0]} avec ces ongles faciles a poser.",
+            "Maquette : Comprend 24 ongles en 12 tailles pour un ajustement ideal.",
+            f"Maquette : Finition brillante durable avec un motif {pattern}.",
+        ]
+        description_fr = (
+            "Maquette : Obtenez une manucure impeccable en quelques minutes. Nos ongles autocollants "
+            "offrent un style durable et sans effort, ideal pour toutes les occasions au Canada."
+        )
+        call_to_action_fr = "Maquette : Ajoutez au panier et trouvez votre nouveau style prefere !"
 
         mock_content = {
-            "title": localized_title,
-            "bullet_points": bullet_points,
-            "description": description,
-            "call_to_action": call_to_action,
+            "canadian_english": {
+                "title": localized_title_en,
+                "bullet_points": bullet_points_en,
+                "description": description_en,
+                "call_to_action": call_to_action_en,
+            },
+            "canadian_french": {
+                "title": localized_title_fr,
+                "bullet_points": bullet_points_fr,
+                "description": description_fr,
+                "call_to_action": call_to_action_fr,
+            },
             "suggested_color_palette": "Pastel pinks and soft whites",
             "suggested_style_keywords": style_tags,
         }
@@ -190,10 +214,18 @@ class GMICloudLLMClient:
 
         return LocalizedMaterial(
             product_id=product.product_id,
-            localized_title=localized_title,
-            bullet_points=bullet_points,
-            description=description,
-            call_to_action=call_to_action,
+            canadian_english=LocalizedCopy(
+                localized_title=localized_title_en,
+                bullet_points=bullet_points_en,
+                description=description_en,
+                call_to_action=call_to_action_en,
+            ),
+            canadian_french=LocalizedCopy(
+                localized_title=localized_title_fr,
+                bullet_points=bullet_points_fr,
+                description=description_fr,
+                call_to_action=call_to_action_fr,
+            ),
             image_prompt=image_prompt,
             source_summary=product.attributes,
         )
@@ -217,7 +249,7 @@ and attributes). Your job is to:
 
 1. Understand the product's style, colour story, shape/length, and target
    customer from the provided fields.
-2. Write natural, on-brand Canadian English marketing copy.
+2. Write natural, on-brand Canadian English and Canadian French marketing copy.
 3. Return a **single JSON object** with the fields described below.
 
 ---
@@ -232,20 +264,16 @@ Output JSON specification:
 
 Return a JSON object with these keys:
 
-- "title": string
-    - 80–120 characters.
-    - Must be a polished, SEO-friendly product title suitable for a Canadian
-      marketplace.
-- "bullet_points": string[]
-    - 3–4 bullet points.
-    - Each bullet should highlight a concrete benefit or feature (fit, finish,
-      wearing occasions, comfort, etc.).
-- "description": string
-    - 200–300 characters.
-    - A short, appealing paragraph explaining why this design is great for
-      Canadian customers.
-- "call_to_action": string
-    - A concise call-to-action encouraging the user to buy now.
+- "canadian_english": object
+    - "title": string, 80–120 chars, polished and SEO-friendly.
+    - "bullet_points": string[], 3–4 concrete feature/benefit bullets.
+    - "description": string, 200–300 chars, appealing and market-appropriate.
+    - "call_to_action": string, concise purchase prompt.
+- "canadian_french": object
+    - "title": string, 80–120 chars, polished and SEO-friendly.
+    - "bullet_points": string[], 3–4 concrete feature/benefit bullets.
+    - "description": string, 200–300 chars, appealing and market-appropriate.
+    - "call_to_action": string, concise purchase prompt.
 - "suggested_color_palette": string
     - A short phrase summarizing the main colours (e.g., "blush pink with gold
       foil accents").
@@ -255,12 +283,34 @@ Return a JSON object with these keys:
 Rules:
 - Only output the JSON object, with double-quoted keys.
 - Do NOT include any explanations, comments, or markdown.
-- All output text fields (title, bullet_points, description, call_to_action,
-  suggested_color_palette, suggested_style_keywords) must be in **English
-  only**. Do not include any Chinese characters in these fields.
+- "canadian_english" fields must be in English only.
+- "canadian_french" fields must be in French only, suitable for Canadian French conventions.
+- "suggested_color_palette" and "suggested_style_keywords" must be in English only.
+- Do not include any Chinese characters in user-facing output fields.
 - If some details are missing in the Chinese source, make tasteful,
   style-consistent assumptions.
 """
+
+    def _build_localized_copy(
+        self,
+        content: Dict[str, Any],
+        language_key: str,
+        product_id: str,
+        language_name: str,
+    ) -> LocalizedCopy:
+        language_payload = content.get(language_key, {})
+        if not isinstance(language_payload, dict):
+            language_payload = {}
+        return LocalizedCopy(
+            localized_title=language_payload.get("title", f"Localized {language_name} Title for {product_id}"),
+            bullet_points=(
+                language_payload.get("bullet_points", [])
+                if isinstance(language_payload.get("bullet_points", []), list)
+                else []
+            ),
+            description=language_payload.get("description", ""),
+            call_to_action=language_payload.get("call_to_action", ""),
+        )
 
     def _parse_response(self, content: Any) -> Dict[str, Any]:
         """Parse the JSON-mode content from the LLM.
