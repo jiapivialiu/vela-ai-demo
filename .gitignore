@@ -1,0 +1,15 @@
+# Local API credential file (do not commit real keys)
+credentials.json
+
+# Local virtualenv
+.venv/
+
+# Cursor project rules (keep local for now)
+.cursor/
+.cursorrules
+
+# macOS metadata
+.DS_Store
+
+# Generated run artifacts
+outputs/
