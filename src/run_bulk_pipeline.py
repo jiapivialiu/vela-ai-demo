@@ -2,7 +2,7 @@
 
 Targets GMI Cloud Inference Engine (same defaults as mtwi_ecommerce_pipeline.parse_args).
 Config keys mirror CLI flags (see configs/bulk_run.yaml). Omitted keys use defaults in
-`build_pipeline_cmd`. Model/env overview: ../agent.md and ../CONFIGURATION.md.
+`build_pipeline_cmd` (e.g. `pipeline.skip_listing_review: true` → `--skip-listing-review`). Model/env overview: ../agent.md and ../CONFIGURATION.md.
 Operator docs: src/README.md (bulk section).
 
 Usage:
@@ -41,6 +41,12 @@ def git_commit_or_unknown(repo_root: Path) -> str:
 
 def build_pipeline_cmd(cfg: Dict[str, Any], run_dir: Path) -> List[str]:
     pipeline_cfg = cfg.get("pipeline", {})
+    rq_image_model = str(
+        pipeline_cfg.get(
+            "additional_image_model",
+            os.getenv("GMI_ADDITIONAL_IMAGE_MODEL", "seedream-5.0-lite"),
+        )
+    )
     cmd = [
         "python",
         "src/mtwi_ecommerce_pipeline.py",
@@ -57,17 +63,19 @@ def build_pipeline_cmd(cfg: Dict[str, Any], run_dir: Path) -> List[str]:
         "--limit",
         str(int(pipeline_cfg.get("limit", 100))),
         "--mask-mode",
-        str(pipeline_cfg.get("mask_mode", "overlay")),
+        str(pipeline_cfg.get("mask_mode", "all")),
         "--erase-strategy",
-        str(pipeline_cfg.get("erase_strategy", "local")),
+        str(pipeline_cfg.get("erase_strategy", "model")),
         "--quality-strategy",
         str(pipeline_cfg.get("quality_strategy", "local")),
         "--eraser-model",
-        str(pipeline_cfg.get("eraser_model", "bria-eraser")),
+        str(pipeline_cfg.get("eraser_model", rq_image_model)),
         "--restore-model",
         str(pipeline_cfg.get("restore_model", "bria-fibo-restore")),
         "--vision-model",
         str(pipeline_cfg.get("vision_model", "Qwen/Qwen3-VL-235B")),
+        "--copy-understand-image",
+        str(pipeline_cfg.get("copy_understand_image", "final")),
         "--english-copy-model",
         str(pipeline_cfg.get("english_copy_model", "openai/gpt-5.4-pro")),
         "--french-copy-model",
@@ -76,14 +84,30 @@ def build_pipeline_cmd(cfg: Dict[str, Any], run_dir: Path) -> List[str]:
         str(pipeline_cfg.get("fallback_english_copy_model", "openai/gpt-5.4-mini")),
         "--fallback-french-copy-model",
         str(pipeline_cfg.get("fallback_french_copy_model", "openai/gpt-5.4-mini")),
+        "--simple-copy-model",
+        str(
+            pipeline_cfg.get(
+                "simple_copy_model",
+                pipeline_cfg.get("fallback_english_copy_model", "openai/gpt-5.4-mini"),
+            )
+        ),
         "--copy-review-english-model",
-        str(pipeline_cfg.get("copy_review_english_model", "openai/gpt-5.4")),
+        str(pipeline_cfg.get("copy_review_english_model", "anthropic/claude-sonnet-4.6")),
         "--copy-review-french-model",
         str(pipeline_cfg.get("copy_review_french_model", "anthropic/claude-sonnet-4.6")),
         "--locale-grammar-english-model",
         str(pipeline_cfg.get("locale_grammar_english_model", "openai/gpt-5.4-nano")),
         "--locale-grammar-french-model",
         str(pipeline_cfg.get("locale_grammar_french_model", "openai/gpt-5.4-nano")),
+        "--copy-generation-mode",
+        str(pipeline_cfg.get("copy_generation_mode", "unified")),
+        "--unified-copy-model",
+        str(
+            pipeline_cfg.get(
+                "unified_copy_model",
+                pipeline_cfg.get("english_copy_model", "openai/gpt-5.4-pro"),
+            )
+        ),
         "--max-attempts",
         str(int(pipeline_cfg.get("max_attempts", 2))),
         "--stability-update-every",
@@ -114,6 +138,11 @@ def build_pipeline_cmd(cfg: Dict[str, Any], run_dir: Path) -> List[str]:
                 str(int(pipeline_cfg.get("additional_image_count", 3))),
             ]
         )
+        fam = pipeline_cfg.get("fallback_additional_image_model")
+        if fam is not None and str(fam).strip():
+            cmd.extend(["--fallback-additional-image-model", str(fam).strip()])
+    else:
+        cmd.append("--no-generate-additional-images")
     if bool(pipeline_cfg.get("disable_restore", True)):
         cmd.append("--disable-restore")
     if bool(pipeline_cfg.get("disable_erase", False)):
@@ -122,6 +151,13 @@ def build_pipeline_cmd(cfg: Dict[str, Any], run_dir: Path) -> List[str]:
         cmd.append("--no-mask")
     if bool(pipeline_cfg.get("mock", False)):
         cmd.append("--mock")
+    if bool(pipeline_cfg.get("no_simple_copy_recovery", False)):
+        cmd.append("--no-simple-copy-recovery")
+    if not bool(pipeline_cfg.get("annotation_audit", True)):
+        cmd.append("--no-annotation-audit")
+    aam = pipeline_cfg.get("annotation_audit_model")
+    if aam is not None and str(aam).strip():
+        cmd.extend(["--annotation-audit-model", str(aam).strip()])
     if pipeline_cfg.get("input_images_glob"):
         cmd.extend(["--input-images-glob", str(pipeline_cfg["input_images_glob"])])
     uc = pipeline_cfg.get("user_copy_instructions")
@@ -136,6 +172,8 @@ def build_pipeline_cmd(cfg: Dict[str, Any], run_dir: Path) -> List[str]:
     uif = pipeline_cfg.get("user_image_instructions_file")
     if uif:
         cmd.extend(["--user-image-instructions-file", str(uif)])
+    if bool(pipeline_cfg.get("skip_listing_review", False)):
+        cmd.append("--skip-listing-review")
     return cmd
 
 

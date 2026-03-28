@@ -1,11 +1,12 @@
 """MTWI → ecommerce pipeline (GMI Cloud Inference Engine).
 
-Flow: text removal (local and/or Request Queue) → optional harmonize → quality (local and/or model) →
-vision (default Qwen/Qwen3-VL-235B) → EN/FR copy (default gpt-5.4-pro / claude-sonnet-4.6) →
-mandatory bilingual vision copy review + mandatory locale grammar review → optional extra images.
+Flow: optional **annotation audit** (VLM JSON per MTWI box: usable vs misaligned, needs processing) →
+text removal (local and/or Request Queue) → optional harmonize (seam blend) → quality (local and/or model) →
+vision (default Qwen/Qwen3-VL-235B; input image selectable: cleaned **final**, raw **source**, or audited **extra1**) → EN/FR copy (**dual image**: original listing + cleaned frame, plus Step3 JSON + full OCR; **unified** or **split** both use one bilingual structured call; fixed `param_*` keys) →
+optional simple bilingual recovery (split only) → Step4b/4c (optional **`--skip-listing-review`**; else EN/FR **parallel** each) → **marketing extras** (**off** by default; enable with **`--generate-additional-images`**): **one RQ call per image** (`num_images=1`); optional **`GMI_EXTRA_IMAGES_BATCH=1`**; per slot **variants → optional fallback → edit** (see env docs); or run **`src/run_marketing_extras_step.py`** after the main job for the same RQ path only.
 
-See agent.md for model table and per-SKU chat call counts; src/README.md for CLI/bulk; CONFIGURATION.md for GMI_* env vars.
-Run: `python src/mtwi_ecommerce_pipeline.py --help` or `scripts/run_one_deliverable_example.sh`.
+See agent.md for model table and per-SKU chat call counts (~6 unified default, ~7 split); src/README.md for CLI/bulk; CONFIGURATION.md for GMI_* env vars.
+`--max-attempts` is capped at **2** (enqueue/chat retries). Run: `python src/mtwi_ecommerce_pipeline.py --help` or `src/run_one_deliverable_example.sh`.
 """
 
 from __future__ import annotations
@@ -13,15 +14,25 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import hashlib
 import json
 import os
+import re
+import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
 
 import requests
+
+from pipeline_progress import (  # noqa: E402
+    pipeline_progress_emit,
+    pipeline_progress_init,
+    pipeline_progress_span,
+)
 
 try:
     from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageStat  # type: ignore
@@ -32,6 +43,13 @@ except Exception:  # pragma: no cover - optional dependency
     ImageEnhance = None
     ImageFilter = None
     ImageStat = None
+
+try:
+    import cv2  # type: ignore
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover - local inpaint fallback
+    cv2 = None  # type: ignore
+    np = None  # type: ignore
 
 
 @dataclass
@@ -63,8 +81,33 @@ class EcommerceArtifact:
     additional_generated_images: Optional[List[str]] = None
     copy_review: Optional[Dict[str, Any]] = None
     locale_grammar_review: Optional[Dict[str, Any]] = None
+    listing_reference_audit: Optional[Dict[str, Any]] = None
     user_copy_instructions: str = ""
     user_image_instructions: str = ""
+
+
+def _rq_post_timeout_tuple(job_deadline_s: float) -> Tuple[float, float]:
+    """(connect, read) for Request Queue **submit** POST.
+
+    Large image payloads can exceed a naive 60s read timeout before the gateway returns
+    ``request_id``. ``read`` defaults to ``max(120, min(900, job_deadline_s))`` so it scales
+    with ``GMI_IMAGE_TIMEOUT`` / per-call ``timeout_s`` unless overridden.
+    """
+    conn = float((os.getenv("GMI_RQ_HTTP_CONNECT_TIMEOUT") or "30").strip() or "30")
+    raw = (os.getenv("GMI_RQ_HTTP_SUBMIT_TIMEOUT") or "").strip()
+    if raw:
+        read = float(raw)
+    else:
+        read = max(120.0, min(900.0, float(job_deadline_s)))
+    return (max(5.0, conn), max(30.0, read))
+
+
+def _rq_poll_timeout_tuple() -> Tuple[float, float]:
+    """(connect, read) for status polling GET."""
+    conn = float((os.getenv("GMI_RQ_POLL_CONNECT_TIMEOUT") or "15").strip() or "15")
+    raw = (os.getenv("GMI_RQ_POLL_READ_TIMEOUT") or "").strip()
+    read = float(raw) if raw else 90.0
+    return (max(5.0, conn), max(15.0, read))
 
 
 class RequestQueueClient:
@@ -85,6 +128,7 @@ class RequestQueueClient:
 
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         enqueue_url = f"{self.base_url}/requests"
+        post_timeout = _rq_post_timeout_tuple(timeout_s)
         last_exc: Optional[Exception] = None
         for attempt in range(1, self.max_attempts + 1):
             try:
@@ -92,7 +136,7 @@ class RequestQueueClient:
                     enqueue_url,
                     headers=headers,
                     json={"model": model, "payload": payload},
-                    timeout=60,
+                    timeout=post_timeout,
                 )
                 resp.raise_for_status()
                 break
@@ -108,9 +152,10 @@ class RequestQueueClient:
             raise RuntimeError(f"Request Queue returned no request_id: {resp.text}")
 
         status_url = f"{self.base_url}/requests/{request_id}"
+        poll_timeout = _rq_poll_timeout_tuple()
         deadline = time.time() + timeout_s
         while time.time() < deadline:
-            poll = requests.get(status_url, headers=headers, timeout=30)
+            poll = requests.get(status_url, headers=headers, timeout=poll_timeout)
             poll.raise_for_status()
             data = poll.json()
             status = data.get("status")
@@ -153,12 +198,10 @@ class RequestQueueClient:
             payload["mask_image"] = mask_data_url
 
         outcome = self.run_model(model=model, payload=payload, timeout_s=float(os.getenv("GMI_IMAGE_TIMEOUT", "240")))
-        result_url = extract_media_url(outcome)
-        if not result_url:
-            return None
-        resp = requests.get(result_url, timeout=120)
-        resp.raise_for_status()
-        return resp.content
+        out = extract_media_bytes_from_outcome(outcome)
+        if not out:
+            _log_rq_outcome_debug(f"run_image_edit({model})", outcome)
+        return out
 
     def run_image_variants(
         self,
@@ -184,23 +227,126 @@ class RequestQueueClient:
         }
         outcome = self.run_model(model=model, payload=payload, timeout_s=float(os.getenv("GMI_IMAGE_TIMEOUT", "300")))
         urls: List[str] = []
+        binaries: List[bytes] = []
         media_urls = outcome.get("media_urls")
         if isinstance(media_urls, list):
             for item in media_urls:
-                if isinstance(item, dict) and isinstance(item.get("url"), str):
-                    urls.append(item["url"])
+                if len(binaries) >= count:
+                    break
+                if isinstance(item, dict):
+                    got = extract_media_bytes_from_outcome(item)
+                    if got:
+                        binaries.append(got)
                 elif isinstance(item, str):
-                    urls.append(item)
-        if not urls:
+                    if item.startswith("http"):
+                        urls.append(item)
+                    else:
+                        dec = _decode_inline_image_string(item)
+                        if dec:
+                            binaries.append(dec)
+        for u in urls:
+            if len(binaries) >= count:
+                break
+            try:
+                r = requests.get(u, timeout=120)
+                r.raise_for_status()
+                binaries.append(r.content)
+            except Exception:
+                pass
+        if len(binaries) < count:
             one = extract_media_url(outcome)
-            if one:
-                urls.append(one)
-        binaries: List[bytes] = []
-        for u in urls[: max(1, count)]:
-            r = requests.get(u, timeout=120)
-            r.raise_for_status()
-            binaries.append(r.content)
-        return binaries
+            if one and len(binaries) < count:
+                try:
+                    r = requests.get(one, timeout=120)
+                    r.raise_for_status()
+                    binaries.append(r.content)
+                except Exception:
+                    pass
+        if not binaries:
+            b = extract_media_bytes_from_outcome(outcome)
+            if b:
+                binaries.append(b)
+        if len(binaries) < count:
+            seen_h = {hashlib.sha256(x).hexdigest() for x in binaries}
+            for raw in extract_all_media_bytes_from_outcome(outcome, max_n=count):
+                if len(binaries) >= count:
+                    break
+                h = hashlib.sha256(raw).hexdigest()
+                if h in seen_h:
+                    continue
+                seen_h.add(h)
+                binaries.append(raw)
+        if not binaries:
+            _log_rq_outcome_debug(f"run_image_variants({model})", outcome)
+        return binaries[: max(1, count)]
+
+
+def _strip_thinking_wrappers(s: str) -> str:
+    """Keep assistant text after the last closing `think` fence (reasoning models often prepend analysis)."""
+    t = s.strip()
+    _bq = chr(96)
+    _think_close = f"{_bq}think{_bq}"
+    if _think_close in t:
+        t = t.rsplit(_think_close, 1)[-1].strip()
+    return t
+
+
+def _message_content_to_text(content: Any) -> str:
+    """Normalize chat completion message.content (string or multimodal parts list)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                picked = False
+                for key in ("text", "content", "value"):
+                    v = block.get(key)
+                    if isinstance(v, str) and v.strip():
+                        parts.append(v)
+                        picked = True
+                        break
+                if not picked and block.get("type") in ("text", "output_text", "input_text"):
+                    tv = block.get("text")
+                    if isinstance(tv, str):
+                        parts.append(tv)
+        return "".join(parts)
+    return str(content)
+
+
+def _extract_choice_assistant_text(body: Any) -> Tuple[str, str]:
+    """Return (assistant_text, finish_reason) from a /chat/completions JSON body."""
+    finish = ""
+    if not isinstance(body, dict):
+        return "", ""
+    try:
+        choices = body.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return "", ""
+        ch0 = choices[0]
+        if not isinstance(ch0, dict):
+            return "", ""
+        finish = str(ch0.get("finish_reason") or "")
+        msg = ch0.get("message")
+        if isinstance(msg, dict):
+            primary = _message_content_to_text(msg.get("content")).strip()
+            if primary:
+                return primary, finish
+            for alt in ("reasoning_content", "reasoning", "thinking"):
+                v = msg.get(alt)
+                if isinstance(v, str) and v.strip():
+                    return v.strip(), finish
+            return "", finish
+        if msg is not None:
+            return _message_content_to_text(msg).strip(), finish
+        tx = ch0.get("text")
+        if isinstance(tx, str):
+            return tx.strip(), finish
+    except (KeyError, IndexError, TypeError):
+        return "", finish
+    return "", finish
 
 
 class ChatClient:
@@ -212,32 +358,108 @@ class ChatClient:
         self.max_attempts = max(1, int(max_attempts))
         self.base_url = os.getenv("GMI_LLM_BASE_URL", "https://api.gmi-serving.com/v1")
 
-    def chat_json(self, model: str, messages: List[Dict[str, Any]], max_tokens: int = 1200, temperature: float = 0.2) -> Dict[str, Any]:
-        if self.mock:
-            return {}
+    def _chat_completion_once(
+        self,
+        model: str,
+        messages: List[Dict[str, Any]],
+        max_tokens: int,
+        temperature: float,
+        response_json_object: Optional[bool],
+    ) -> requests.Response:
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        payload = {
+        want_json_mode = os.getenv("GMI_CHAT_JSON_RESPONSE_FORMAT", "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if response_json_object is False:
+            tiers: List[bool] = [False]
+        elif response_json_object is True:
+            tiers = [True, False] if want_json_mode else [False]
+        else:
+            tiers = [True, False] if want_json_mode else [False]
+        payload_base: Dict[str, Any] = {
             "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
-            "response_format": {"type": "json_object"},
         }
         last_exc: Optional[Exception] = None
+        resp: Optional[requests.Response] = None
         for attempt in range(1, self.max_attempts + 1):
-            try:
-                resp = requests.post(f"{self.base_url}/chat/completions", headers=headers, json=payload, timeout=90)
-                resp.raise_for_status()
+            for use_json_object in tiers:
+                payload = {**payload_base}
+                if use_json_object:
+                    payload["response_format"] = {"type": "json_object"}
+                try:
+                    r = requests.post(
+                        f"{self.base_url}/chat/completions",
+                        headers=headers,
+                        json=payload,
+                        timeout=120,
+                    )
+                except Exception as exc:
+                    last_exc = exc
+                    break
+                if r.status_code == 400 and use_json_object and want_json_mode:
+                    continue
+                try:
+                    r.raise_for_status()
+                except Exception as exc:
+                    last_exc = exc
+                    break
+                resp = r
                 break
-            except Exception as exc:
-                last_exc = exc
-                if attempt >= self.max_attempts:
-                    raise
-                time.sleep(min(2 * attempt, 8))
-        if last_exc and "resp" not in locals():
-            raise last_exc
-        content = resp.json()["choices"][0]["message"]["content"]
-        return parse_json_content(content)
+            if resp is not None:
+                break
+            if attempt >= self.max_attempts:
+                if last_exc:
+                    raise last_exc
+                raise RuntimeError("chat completion failed with no response")
+            time.sleep(min(2 * attempt, 8))
+        if resp is None:
+            if last_exc:
+                raise last_exc
+            raise RuntimeError("chat completion failed with no response")
+        return resp
+
+    def chat_plain(
+        self,
+        model: str,
+        messages: List[Dict[str, Any]],
+        max_tokens: int = 1200,
+        temperature: float = 0.2,
+        response_json_object: Optional[bool] = None,
+    ) -> str:
+        """Same as chat_json but returns raw assistant text (no JSON parse)."""
+        if self.mock:
+            return ""
+        resp = self._chat_completion_once(model, messages, max_tokens, temperature, response_json_object)
+        body = resp.json()
+        text, _finish = _extract_choice_assistant_text(body)
+        return text
+
+    def chat_json(
+        self,
+        model: str,
+        messages: List[Dict[str, Any]],
+        max_tokens: int = 1200,
+        temperature: float = 0.2,
+        response_json_object: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        if self.mock:
+            return {}
+        resp = self._chat_completion_once(model, messages, max_tokens, temperature, response_json_object)
+        body = resp.json()
+        text, finish = _extract_choice_assistant_text(body)
+        parsed = parse_json_content(text)
+        if not parsed and text.strip() and finish == "length" and max_tokens < 8192:
+            bumped = min(max_tokens * 2, 8192)
+            resp2 = self._chat_completion_once(model, messages, bumped, temperature, response_json_object)
+            text2, _f2 = _extract_choice_assistant_text(resp2.json())
+            parsed = parse_json_content(text2)
+        return parsed if isinstance(parsed, dict) else {}
 
 
 def resolve_operator_instructions(
@@ -434,7 +656,137 @@ def select_spans_to_erase(
 
     # Heuristic fallback: erase obvious overlays by text patterns.
     erase = [i for i, s in enumerate(spans) if guess_overlay_span_by_text(s.text)]
+    if not erase and spans and chat.mock:
+        warnings.append(
+            "overlay_mode_mock_no_span_match: erasing all annotation boxes "
+            "(mock skips VLM; English/non-Chinese labels often miss heuristics; use --mask-mode all explicitly)"
+        )
+        return list(range(len(spans)))
     return erase
+
+
+def audit_mtwi_annotation_spans(
+    chat: ChatClient,
+    model: str,
+    source_image: Path,
+    spans: List[OCRTextSpan],
+    warnings: List[str],
+) -> Optional[List[int]]:
+    """VLM pass: validate each MTWI line (quad + transcript) and choose which boxes go into the erase mask.
+
+    Returns:
+        - list of indices to erase (may be empty if nothing should be processed)
+        - None if audit failed or should fall back to ``select_spans_to_erase`` (mask_mode)
+
+    Source language of transcripts may be Chinese or English. Output reasoning is internal; JSON field values are English.
+    """
+    if chat.mock or not spans:
+        return None
+
+    span_lines: List[str] = []
+    for i, s in enumerate(spans):
+        x1, y1, x2, y2 = span_bbox(s)
+        t = (s.text or "").replace("\n", " ").strip()
+        if len(t) > 240:
+            t = t[:237] + "..."
+        span_lines.append(f'{i}: transcript="{t}" axis_aligned_bbox_xyxy=[{x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f}]')
+
+    prompt = (
+        "You audit MTWI-style text annotations for an ecommerce product photo cleanup pipeline.\n"
+        "The image is attached. Each line is one annotation: index, transcript string from the label file, "
+        "and axis-aligned bounding box (min/max of the four quad corners in image pixel coordinates).\n\n"
+        "For EVERY index from 0 through "
+        + str(len(spans) - 1)
+        + ", output one decision object with:\n"
+        "- index: same integer\n"
+        "- bbox_contains_target_text: true if readable text matching the transcript (allow minor OCR drift) "
+        "appears inside or touching that bbox; false if the box is empty, misplaced, or covers unrelated pixels\n"
+        "- annotation_usable: false if the box is clearly wrong (text visibly outside the box, or box on wrong object); "
+        "true if the box is at least roughly aligned with some text/sticker/watermark\n"
+        "- needs_processing: true if this region should be inpainted to remove overlaid text, stickers, watermarks, "
+        "URLs, or promo banners; false to leave untouched (e.g. product-native printed specs to keep for listing accuracy)\n"
+        "- notes: short English note if any issue\n\n"
+        "Rules:\n"
+        "- If a box is unusable or misplaced, set annotation_usable=false and needs_processing=false (do not mask it).\n"
+        "- If transcript does not match what is visible in the box, set bbox_contains_target_text=false; "
+        "still set needs_processing=true only when the box clearly contains removable overlay text anyway.\n"
+        "- When unsure about product-print vs overlay, prefer needs_processing=true for obvious seller/watermark content; "
+        "prefer false for model numbers/ingredients printed on the product body.\n"
+        "- You MUST include every index exactly once.\n\n"
+        "Return JSON only:\n"
+        '{"decisions":[{"index":0,"bbox_contains_target_text":true,"annotation_usable":true,"needs_processing":true,"notes":""}],'
+        '"summary":""}\n\n'
+        "Annotations:\n" + "\n".join(span_lines)
+    )
+
+    try:
+        data = chat.chat_json(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You validate MTWI bounding boxes and decide erase mask membership. Reply with JSON only.",
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": path_to_data_url(source_image)}},
+                    ],
+                },
+            ],
+            max_tokens=1200,
+            temperature=0.1,
+        )
+    except Exception as exc:
+        warnings.append(f"annotation_audit_failed: {exc}")
+        return None
+
+    decisions = data.get("decisions") if isinstance(data, dict) else None
+    if not isinstance(decisions, list) or not decisions:
+        warnings.append("annotation_audit_failed: missing_decisions")
+        return None
+
+    by_index: Dict[int, Dict[str, Any]] = {}
+    for raw in decisions:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            idx = int(raw.get("index", -1))
+        except Exception:
+            continue
+        if 0 <= idx < len(spans):
+            by_index[idx] = raw
+
+    if len(by_index) != len(spans):
+        warnings.append(
+            f"annotation_audit_incomplete: got {len(by_index)} decisions for {len(spans)} spans; falling back to mask_mode"
+        )
+        return None
+
+    erase_indices: List[int] = []
+    for i in range(len(spans)):
+        d = by_index[i]
+        usable = bool(d.get("annotation_usable", True))
+        needs = bool(d.get("needs_processing", False))
+        bbox_ok = bool(d.get("bbox_contains_target_text", True))
+        note = (d.get("notes") or "").strip()
+        if not usable:
+            warnings.append(f"annotation_audit_idx_{i}_unusable_skipped: {note or 'misaligned or invalid box'}")
+            continue
+        if not needs:
+            if note:
+                warnings.append(f"annotation_audit_idx_{i}_preserve: {note}")
+            continue
+        if not bbox_ok:
+            warnings.append(f"annotation_audit_idx_{i}_transcript_mismatch: {note or 'check label file'}")
+        erase_indices.append(i)
+
+    summary = (data.get("summary") or "").strip() if isinstance(data, dict) else ""
+    if summary:
+        warnings.append(f"annotation_audit_summary: {summary[:500]}")
+
+    return sorted(set(erase_indices))
 
 
 def run_step1_text_erase(
@@ -476,44 +828,12 @@ def run_step1_text_erase(
     return erased_path
 
 
-def run_step1_text_erase_local(
-    source_image: Path,
+def _local_erase_strip_paste_fallback(
+    img: "Image.Image",
     spans: List[OCRTextSpan],
-    product_id: str,
-    out_dir: Path,
-    use_mask: bool,
-) -> Optional[Path]:
-    """Deterministic local erase that removes text regions completely.
-
-    Strategy:
-    - Build a text mask from annotation boxes.
-    - Replace each box with surrounding background estimate (not mosaic text).
-    - Blend edges softly to avoid visible seams.
-    """
-    if Image is None or ImageDraw is None:
-        return None
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    img = Image.open(source_image).convert("RGB")
-    mask = Image.new("L", img.size, 0)
-    draw = ImageDraw.Draw(mask)
-    for span in spans:
-        x1, y1, x2, y2 = span_bbox(span)
-        # Slight dilation to fully cover glyph strokes
-        pad = 3
-        draw.rectangle(
-            [
-                (max(0, x1 - pad), max(0, y1 - pad)),
-                (min(img.size[0] - 1, x2 + pad), min(img.size[1] - 1, y2 + pad)),
-            ],
-            fill=255,
-        )
-
-    if not use_mask:
-        erased_path = out_dir / f"{product_id}_erased.png"
-        img.save(erased_path)
-        return erased_path
-
+    mask: "Image.Image",
+) -> "Image.Image":
+    """Legacy fill: paste adjacent strips (can look copy-pasted; used only without OpenCV)."""
     work = img.copy()
     w, h = img.size
     for span in spans:
@@ -528,7 +848,6 @@ def run_step1_text_erase_local(
         bw = x2 - x1 + 1
         bh = y2 - y1 + 1
 
-        # Prefer copying nearby texture strips (top/bottom), fallback left/right.
         patch = None
         top_y2 = y1 - 1
         top_y1 = top_y2 - bh + 1
@@ -551,17 +870,75 @@ def run_step1_text_erase_local(
                         patch = img.crop((right_x1, y1, right_x2 + 1, y2 + 1))
 
         if patch is None or patch.size != (bw, bh):
-            # Last fallback: local blurred region, but never flat color blocks.
             local = img.crop((max(0, x1 - 8), max(0, y1 - 8), min(w, x2 + 9), min(h, y2 + 9)))
             patch = local.resize((bw, bh), Image.BILINEAR).filter(ImageFilter.GaussianBlur(radius=2))
 
         work.paste(patch, (x1, y1))
 
-    # Feather only masked boundaries for a cleaner transition.
     soft_mask = mask.filter(ImageFilter.GaussianBlur(radius=2))
     blended = Image.composite(work, img, soft_mask)
     blended = blended.filter(ImageFilter.SMOOTH_MORE)
-    blended = blended.filter(ImageFilter.GaussianBlur(radius=0.6))
+    return blended.filter(ImageFilter.GaussianBlur(radius=0.6))
+
+
+def run_step1_text_erase_local(
+    source_image: Path,
+    spans: List[OCRTextSpan],
+    product_id: str,
+    out_dir: Path,
+    use_mask: bool,
+) -> Optional[Path]:
+    """Deterministic local erase: white underlay inside mask, then OpenCV inpaint (diffusion from edges).
+
+    Avoids strip copy-paste artifacts. Requires ``opencv-python-headless`` + ``numpy``; otherwise falls back
+    to the old adjacent-strip method. Radius: env ``GMI_LOCAL_INPAINT_RADIUS`` (default ``6``).
+    """
+    if Image is None or ImageDraw is None:
+        return None
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    img = Image.open(source_image).convert("RGB")
+    mask = Image.new("L", img.size, 0)
+    draw = ImageDraw.Draw(mask)
+    for span in spans:
+        x1, y1, x2, y2 = span_bbox(span)
+        pad = 3
+        draw.rectangle(
+            [
+                (max(0, x1 - pad), max(0, y1 - pad)),
+                (min(img.size[0] - 1, x2 + pad), min(img.size[1] - 1, y2 + pad)),
+            ],
+            fill=255,
+        )
+
+    if not use_mask:
+        erased_path = out_dir / f"{product_id}_erased.png"
+        img.save(erased_path)
+        return erased_path
+
+    if cv2 is not None and np is not None:
+        mask_u8 = np.array(mask, dtype=np.uint8)
+        if not np.any(mask_u8):
+            erased_path = out_dir / f"{product_id}_erased.png"
+            img.save(erased_path)
+            return erased_path
+        # Slight dilation so glyph anti-aliases sit inside the inpaint region.
+        k = np.ones((3, 3), np.uint8)
+        mask_u8 = cv2.dilate(mask_u8, k, iterations=1)
+        rgb = np.array(img, dtype=np.uint8)
+        filled = rgb.copy()
+        filled[mask_u8 > 0] = (255, 255, 255)
+        try:
+            rad = max(1, min(24, int(os.getenv("GMI_LOCAL_INPAINT_RADIUS", "6"))))
+        except ValueError:
+            rad = 6
+        bgr = cv2.cvtColor(filled, cv2.COLOR_RGB2BGR)
+        out_bgr = cv2.inpaint(bgr, mask_u8, inpaintRadius=rad, flags=cv2.INPAINT_NS)
+        out_rgb = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)
+        blended = Image.fromarray(out_rgb, mode="RGB")
+    else:
+        print("OpenCV/numpy not available; local erase uses legacy strip paste (install opencv-python-headless).")
+        blended = _local_erase_strip_paste_fallback(img, spans, mask)
 
     erased_path = out_dir / f"{product_id}_erased.png"
     blended.save(erased_path)
@@ -610,8 +987,9 @@ def run_step2_harmonize_model(
 ) -> Optional[Path]:
     """Model-based naturalization pass after deterministic text removal."""
     prompt = (
-        "Naturalize the image after text removal. "
-        "Fix abrupt patches, color seams, and texture inconsistencies in erased regions. "
+        "Naturalize the image after text removal / inpainting. "
+        "Blend erased regions seamlessly with surrounding texture, lighting, and color so the result looks untouched. "
+        "Fix abrupt patches, seams, and repetitive cloning artifacts. "
         "Keep the exact same product, geometry, material, color, and composition. "
         "Do not add text, logos, new objects, or redesign."
     )
@@ -630,6 +1008,123 @@ def run_step2_harmonize_model(
     return harmonized_path
 
 
+def _rq_model_id_has_seedream(model_id: str) -> bool:
+    return "seedream" in (model_id or "").lower()
+
+
+def _record_extra_marketing_exception(
+    exc: BaseException,
+    *,
+    stage: str,
+    model_id: str,
+    warn_tag: str,
+    warnings: Optional[List[str]],
+) -> None:
+    """Log RQ failures to stderr and ``warnings`` (manifest); avoids silent ``except: pass``."""
+    detail = str(exc).strip() or repr(exc)
+    if len(detail) > 480:
+        detail = detail[:477] + "..."
+    msg = f"extra_images_rq_{stage}_failed: tag={warn_tag} model={model_id!r} {type(exc).__name__}: {detail}"
+    print(msg, file=sys.stderr)
+    if warnings is not None:
+        warnings.append(msg)
+
+
+def _extra_marketing_effective_use_edit_fallback(primary_model: str, use_edit_fallback: bool) -> bool:
+    """Seedream-style IDs default to variants-only (closer to early pipeline); opt-in edit chain via env."""
+    if not use_edit_fallback:
+        return False
+    if not _rq_model_id_has_seedream(primary_model):
+        return True
+    force = (os.getenv("GMI_EXTRA_IMAGES_SEEDREAM_USE_EDIT_FALLBACK") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    return force
+
+
+def _extra_marketing_backfill_cap(primary_model: str) -> int:
+    """Fewer generic backfill rounds for Seedream (each round can cost full RQ timeouts)."""
+    if _rq_model_id_has_seedream(primary_model):
+        try:
+            return max(0, int((os.getenv("GMI_EXTRA_IMAGES_SEEDREAM_BACKFILL_CAP") or "2").strip()))
+        except ValueError:
+            return 2
+    return 6
+
+
+def _extra_marketing_fetch_bytes(
+    rq: RequestQueueClient,
+    source_for_generation: Path,
+    prompt: str,
+    primary_model: str,
+    fallback_model: Optional[str],
+    *,
+    use_edit_fallback: bool,
+    ref_bytes: bytes,
+    warnings: Optional[List[str]],
+    warn_tag: str,
+) -> Optional[bytes]:
+    """One slot: variants (primary → optional fallback model) then optional ``run_image_edit`` same order.
+
+    Drops outputs whose raw bytes equal the reference file (common RQ no-op) unless ``rq.mock``.
+    For model ids containing ``seedream``, ``run_image_edit`` is skipped unless
+    ``GMI_EXTRA_IMAGES_SEEDREAM_USE_EDIT_FALLBACK=1`` (see ``_extra_marketing_effective_use_edit_fallback``).
+    """
+    models: List[str] = [primary_model]
+    fb = (fallback_model or "").strip()
+    if fb and fb != primary_model:
+        models.append(fb)
+
+    use_edit = _extra_marketing_effective_use_edit_fallback(primary_model, use_edit_fallback)
+
+    def _accept(blob: Optional[bytes]) -> Optional[bytes]:
+        if not blob:
+            return None
+        if rq.mock:
+            return blob
+        if ref_bytes and blob == ref_bytes:
+            if warnings is not None:
+                warnings.append(f"extra_images_identical_to_reference_{warn_tag}")
+            return None
+        return blob
+
+    for m in models:
+        try:
+            one = rq.run_image_variants(
+                model=m,
+                reference_image=source_for_generation,
+                prompt=prompt,
+                count=1,
+            )
+            got = _accept(one[0] if one else None)
+            if got:
+                return got
+        except Exception as exc:
+            _record_extra_marketing_exception(
+                exc, stage="variants", model_id=m, warn_tag=warn_tag, warnings=warnings
+            )
+    if use_edit and not rq.mock:
+        for m in models:
+            try:
+                blob = rq.run_image_edit(
+                    model=m,
+                    source_image=source_for_generation,
+                    prompt=prompt,
+                    mask_image=None,
+                )
+                got = _accept(blob)
+                if got:
+                    return got
+            except Exception as exc:
+                _record_extra_marketing_exception(
+                    exc, stage="image_edit", model_id=m, warn_tag=warn_tag, warnings=warnings
+                )
+    return None
+
+
 def generate_additional_product_images(
     rq: RequestQueueClient,
     source_for_generation: Path,
@@ -639,13 +1134,40 @@ def generate_additional_product_images(
     count: int,
     structured_attributes: Optional[Dict[str, Any]] = None,
     user_image_instructions: str = "",
+    scenario_offset: int = 0,
+    first_file_index: int = 1,
+    warnings: Optional[List[str]] = None,
+    fallback_model: Optional[str] = None,
 ) -> List[str]:
     """Generate additional images of the same product from repaired image.
 
-    Default plan (first 3 images):
-    1) alternate angle
-    2) matched accessory/styling context
-    3) lifestyle human-in-use
+    **Default**: one Request Queue call **per** extra image with ``num_images=1`` and a single shot line
+    (alternate angle → lifestyle → scene, then generic backfill). This matches the pre-refactor pipeline and
+    works reliably with Seedream-style models that often return empty ``media_urls`` when ``num_images>1``.
+
+    Optional: set ``GMI_EXTRA_IMAGES_BATCH=1`` to try **one** batched call (``num_images=N`` + numbered briefs)
+    first, then fill any shortfall with per-shot ``count=1`` calls.
+
+    Backfill: up to **6** generic-angle attempts for most models; **Seedream** ids (name contains ``seedream``) default
+    to **2** (``GMI_EXTRA_IMAGES_SEEDREAM_BACKFILL_CAP``).
+
+    Each slot uses **variants → optional fallback model** by default; **``run_image_edit``** second path is **off** unless
+    ``GMI_EXTRA_IMAGES_USE_EDIT_FALLBACK=1`` / ``true`` / ``on``.
+    **Seedream** ids still require **``GMI_EXTRA_IMAGES_SEEDREAM_USE_EDIT_FALLBACK=1``** in addition, to enable that edit path.
+    RQ errors are appended to ``warnings`` and printed to stderr.
+
+    Outputs identical to the reference file bytes are rejected (live mode) so we do not treat echo responses as success.
+
+    Optional ``fallback_model`` or env ``GMI_FALLBACK_IMAGE_MODEL``: second RQ model id if the primary returns empty.
+
+    Parallel per-shot requests: ``GMI_EXTRA_IMAGES_MAX_PARALLEL`` (default ``1`` = sequential; try ``2`` to speed up,
+    watch for rate limits).
+
+    Placeholder copy of the reference image is **opt-in** only: set ``GMI_EXTRA_IMAGES_PLACEHOLDER=1`` to fill
+    missing slots with the reference (legacy). Otherwise shortfall is reported via warnings + fewer files.
+
+    ``scenario_offset`` skips the first N scenario lines (e.g. after extra_1 was already generated).
+    ``first_file_index`` sets the starting suffix for ``*_extra_{n}.png`` filenames.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     product_type = ""
@@ -656,53 +1178,283 @@ def generate_additional_product_images(
         features = [str(x) for x in structured_attributes.get("key_features", [])[:4]]
     feature_text = ", ".join(features)
 
-    base = (
-        "Generate an ecommerce image of the SAME product shown in the reference image. "
-        "Preserve identity: same shape, color family, material, and branding details. "
-        "No text, no watermark, no logo overlays."
+    base_identity = (
+        "TASK: Output ONE new photorealistic ecommerce-style frame. Use the reference image as the **product identity "
+        "anchor** (same SKU: shape, colors, materials, visible branding zones, bundled items). You **may** change "
+        "camera, lighting, background, and staging strongly so the result is **visibly different** from the reference "
+        "composition — the goal is marketing variety, not a near-duplicate crop.\n"
+        "Rules: no readable text, watermarks, price tags, or UI overlays in the output. Do not swap in a different "
+        "product category or unrelated object. Follow this request’s VARIANT role: (1) new angle / studio, "
+        "(2) new real-world usage context without a visible person, (3) person clearly using the product.\n"
+        "**Physical realism:** Depict people and products **as in real life**, with a **relaxed, candid** feel when someone "
+        "appears — comfortable posture, natural arms and wrists, believable weight; **avoid** stiff mannequin or overly "
+        "rigid “catalog freeze” poses, while still showing **plausible** use. Infer **intended use** from the reference; "
+        "keep **contact / effect zone** and **orientation** believable (working end toward the real target, credible grip). "
+        "**Directional tools only:** if the reference clearly separates an **emitting / output end** from the **opposite "
+        "end** (intake, rear housing, etc.), do **not** reverse them — output must not point away while the wrong end "
+        "presses the target. "
+        "**Body-directed products (infer from reference):** if the item is meant to **act on the user** (contact, airflow, "
+        "light, vibration, application, or wear on head/face/hands/body — not only on external objects), the scene must "
+        "show **reasonable interaction**: correct **body region** as the intended target, **approach angle** and **distance** "
+        "that match how that product type is normally used, and a **coherent mode of use** (how it meets the body or directs "
+        "output toward it). Do not treat an unrelated body area as the main target while the product clearly targets "
+        "somewhere else. **No-people shots:** rest on surfaces naturally; avoid impossible balance. Cords and lighting follow "
+        "physics.\n"
     )
+    context_bits: List[str] = []
     if product_type:
-        base += f" Product type: {product_type}."
+        context_bits.append(
+            f"Product category (for environment, props, and **person-in-use** poses): {product_type}. "
+            f"If someone appears, show a **relaxed, typical** moment of using a **{product_type}** — natural pose plus "
+            f"**plausible target body region or surface**, **orientation**, and **angle/distance** for real use (infer from "
+            f"the reference and this label; especially if the item acts **on the person**, keep interaction physically "
+            f"reasonable; not stiff staging)."
+        )
     if feature_text:
-        base += f" Product cues: {feature_text}."
+        context_bits.append(f"On-pack / listing cues (do not render as overlaid text): {feature_text}.")
     if user_image_instructions.strip():
-        base += (
-            " Operator style requirements for shots (background, lighting, mood; keep same product identity): "
+        context_bits.append(
+            "Operator preferences (lighting mood, palette; must not change which product this is): "
             + user_image_instructions.strip()
         )
+    context_block = ("\n" + " ".join(context_bits) + "\n") if context_bits else ""
 
-    scenario_prompts = [
-        base + " Shot type: alternate angle (3/4 view), clean studio background.",
-        base + " Shot type: paired with a suitable accessory/context prop for this product category, still product-focused.",
-        base + " Shot type: realistic lifestyle image with a person naturally using the product.",
+    # Three fixed roles (per product): (1) different angle — studio packshot, (2) different application scenario —
+    # contextual “where it’s used” without a person, (3) person-in-use lifestyle scene.
+    scenario_suffixes = [
+        (
+            "VARIANT 1 — DIFFERENT ANGLE (STUDIO PRODUCT SHOT, NO PEOPLE): "
+            "Focus on a **clearly new camera angle** vs the reference (e.g. opposite three-quarter, higher/lower eye line, "
+            "slight top-down, or ~90° on-axis rotation). Studio or catalog look: white / pale-gray / soft-gradient sweep OK; "
+            "optional minimal prop is fine (clear acrylic riser, subtle linen, soft shadow card) as long as it stays "
+            "neutral and does not become a lifestyle room scene. No people, no hands. Lighting may differ from the reference "
+            "(harder key, softer wrap, or rim) to reinforce that this is a new shot, not a copy. "
+            "**Placement:** product lies on or leans against a believable support (sweep, riser, cloth); if upright, use a "
+            "stable base or angle that matches how this **product type** is normally displayed — **not** a magic vertical "
+            "balance on a bare table."
+        ),
+        (
+            "VARIANT 2 — DIFFERENT APPLICATION SCENARIO (IN-USE CONTEXT, NO VISIBLE PERSON): "
+            "This image is about switching the usage context: place the SAME product in a **believable real-world setting** "
+            "where this type of item would plausibly sit or be staged (infer from the reference; one coherent environment). "
+            "Natural ambient light; background and props support “where you’d use it” but stay "
+            "softer than the hero product. Do not show a recognizable person, face, or full hands; at most an extremely "
+            "blurred partial wrist edge if unavoidable. Product must remain the sharp focal subject. "
+            "**Placement:** on a **flat stable surface** (counter, shelf, open bag, tray) in a natural resting pose — "
+            "cord coiled or draped realistically if visible; **do not** show the item standing unsupported in an unstable "
+            "pose unless the product’s shape clearly supports a stable freestanding display."
+        ),
+        (
+            "VARIANT 3 — PERSON IN USE (LIFESTYLE USAGE SCENE): "
+            "**Mood:** **Relaxed, everyday lifestyle** — a candid moment (mid-motion OK), not a stiff symmetrical demo pose "
+            "or frozen mannequin. Comfortable shoulders, natural elbow/wrist angles, soft energy.\n"
+            "**Use logic:** one adult; setting fits the product’s domain (infer from reference). Show **primary intended use** "
+            "with **interaction that makes sense** — correct **who/what is being acted on** (body region, worn zone, or "
+            "external substrate as appropriate), **how the product meets or aims at that target**, and **viewing angle** "
+            "that still reads the action clearly. If the product **acts on the user**, prioritize **realistic angle of "
+            "approach** and **distance** for that mode of use (not decorative mis-aim). Match reference geometry: **functional "
+            "output / working end** toward the **real target**; **do not** reverse orientation (output away while the wrong "
+            "end touches the target). Hands rest naturally on grips; controls plausible for **this** SKU. Product identity "
+            "matches the reference. Face may be turned away, cropped, or soft focus; warm lighting; background softly blurred."
+        ),
     ]
+    backfill_suffix = (
+        "VARIANT — EXTRA CATALOG ANGLE: New three-quarter or slight top-down angle vs the reference; "
+        "clean neutral studio or minimal set; no people; product-centered. "
+        "Product rests or leans believably on the set — no unstable vertical balancing on a bare surface."
+    )
 
+    def _shot_prompt(variant_body: str) -> str:
+        return base_identity + context_block + "\n" + variant_body + "\n"
+
+    want = max(0, int(count))
+    if want == 0:
+        return []
+
+    off = max(0, int(scenario_offset))
+    start_idx = max(1, int(first_file_index))
+    shot_lines: List[str] = []
+    si = off
+    while len(shot_lines) < want and si < len(scenario_suffixes):
+        shot_lines.append(scenario_suffixes[si])
+        si += 1
+    while len(shot_lines) < want:
+        shot_lines.append(backfill_suffix)
+
+    extra_dbg = (os.getenv("GMI_EXTRA_IMAGES_DEBUG") or "").strip().lower() in ("1", "true", "yes", "on")
+
+    def _log_extra(stage: str, slot_idx: int, prompt: str, returned_bytes: bool) -> None:
+        if not extra_dbg:
+            return
+        digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+        head = " ".join(prompt.split())[:200]
+        msg = (
+            f"extra_images_debug: {stage} slot={slot_idx} model={model!r} "
+            f"prompt_len={len(prompt)} sha256_12={digest} returned_bytes={returned_bytes} head={head!r}"
+        )
+        if warnings is not None:
+            warnings.append(msg)
+        print(msg, file=sys.stderr)
+
+    if extra_dbg:
+        for i, body in enumerate(shot_lines[:want]):
+            p = _shot_prompt(body)
+            _log_extra("planned_prompt_digest", i, p, False)
+
+    batch_first = (os.getenv("GMI_EXTRA_IMAGES_BATCH") or "0").strip().lower() in ("1", "true", "yes", "on")
     binaries: List[bytes] = []
-    for p in scenario_prompts[: max(1, count)]:
-        extra = rq.run_image_variants(
-            model=model,
-            reference_image=source_for_generation,
-            prompt=p,
-            count=1,
-        )
-        if extra:
-            binaries.extend(extra[:1])
 
-    # Backfill if model returns fewer images than requested.
-    backfill_round = 0
-    while len(binaries) < count and backfill_round < 6:
-        extra = rq.run_image_variants(
-            model=model,
-            reference_image=source_for_generation,
-            prompt=base + " Shot type: clean alternate ecommerce angle.",
-            count=1,
+    if batch_first and want > 0:
+        brief_blocks = "\n\n---\n\n".join(
+            f"IMAGE {i + 1} OF {want} (must differ from other images and from reference framing):\n{_shot_prompt(shot_lines[i])}"
+            for i in range(want)
         )
-        if extra:
-            binaries.extend(extra[:1])
+        multi_prompt = (
+            base_identity
+            + context_block
+            + f"\n\nGenerate exactly {want} full-frame product images in this single request. "
+            "Each IMAGE block is one output and must follow that block’s VARIANT role: "
+            "block 1 = different angle (studio only), block 2 = different application/usage scenario (no visible person), "
+            "block 3 = person-in-use lifestyle. Do not reuse the same creative role across blocks. "
+            "Same product identity across all; no text or watermarks in outputs. "
+            "All outputs: **physical realism** above; person blocks = **relaxed but physically reasonable** use — correct "
+            "body/target, angle, and mode when the product acts on the person; correct orientation for directional tools.\n\n"
+            + brief_blocks
+        )
+        try:
+            binaries = list(
+                rq.run_image_variants(
+                    model=model,
+                    reference_image=source_for_generation,
+                    prompt=multi_prompt,
+                    count=want,
+                )
+            )[:want]
+        except Exception as exc:
+            binaries = []
+            _record_extra_marketing_exception(
+                exc, stage="batch_variants", model_id=model, warn_tag="batch0", warnings=warnings
+            )
+        _log_extra("batch_variants_rq", 0, multi_prompt, bool(binaries))
+
+    use_edit_fb = (os.getenv("GMI_EXTRA_IMAGES_USE_EDIT_FALLBACK") or "0").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+    fb_resolved = (fallback_model or "").strip() or (os.getenv("GMI_FALLBACK_IMAGE_MODEL") or "").strip() or None
+    ref_bytes = source_for_generation.read_bytes() if not rq.mock else b""
+    if binaries and ref_bytes:
+        n_batch = len(binaries)
+        binaries = [b for b in binaries if b != ref_bytes]
+        if len(binaries) < n_batch and warnings is not None:
+            warnings.append(
+                "extra_images_batch_dropped_reference_identical: removed batch output(s) equal to reference bytes"
+            )
+
+    try:
+        parallel = max(1, min(8, int((os.getenv("GMI_EXTRA_IMAGES_MAX_PARALLEL") or "1").strip())))
+    except ValueError:
+        parallel = 1
+
+    if len(binaries) < want and parallel <= 1:
+        for si in range(len(binaries), want):
+            prompt_one = _shot_prompt(shot_lines[si])
+            got_b = _extra_marketing_fetch_bytes(
+                rq,
+                source_for_generation,
+                prompt_one,
+                model,
+                fb_resolved,
+                use_edit_fallback=use_edit_fb,
+                ref_bytes=ref_bytes,
+                warnings=warnings,
+                warn_tag=f"slot{si}",
+            )
+            _log_extra("per_shot_merged_rq", si, prompt_one, bool(got_b))
+            if got_b:
+                binaries.append(got_b)
+
+    elif len(binaries) < want:
+        slots = list(range(len(binaries), want))
+
+        def _parallel_extra_slot(si: int) -> Tuple[int, Optional[bytes]]:
+            prompt_one = _shot_prompt(shot_lines[si])
+            b = _extra_marketing_fetch_bytes(
+                rq,
+                source_for_generation,
+                prompt_one,
+                model,
+                fb_resolved,
+                use_edit_fallback=use_edit_fb,
+                ref_bytes=ref_bytes,
+                warnings=warnings,
+                warn_tag=f"slot{si}",
+            )
+            return si, b
+
+        got_by_si: Dict[int, Optional[bytes]] = {}
+        workers = min(parallel, max(1, len(slots)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            fut_map = {pool.submit(_parallel_extra_slot, si): si for si in slots}
+            for fut in as_completed(fut_map):
+                si, blob = fut.result()
+                got_by_si[si] = blob
+        for si in sorted(slots):
+            prompt_one = _shot_prompt(shot_lines[si])
+            got_b = got_by_si.get(si)
+            _log_extra("per_shot_merged_rq", si, prompt_one, bool(got_b))
+            if got_b:
+                binaries.append(got_b)
+
+    backfill_full = _shot_prompt(backfill_suffix)
+    backfill_round = 0
+    backfill_max = _extra_marketing_backfill_cap(model)
+    while len(binaries) < want and backfill_round < backfill_max:
+        slot_bf = len(binaries)
+        got_bf = _extra_marketing_fetch_bytes(
+            rq,
+            source_for_generation,
+            backfill_full,
+            model,
+            fb_resolved,
+            use_edit_fallback=use_edit_fb,
+            ref_bytes=ref_bytes,
+            warnings=warnings,
+            warn_tag=f"backfill{backfill_round}",
+        )
+        _log_extra("backfill_merged_rq", slot_bf, backfill_full, bool(got_bf))
+        if got_bf:
+            binaries.append(got_bf)
         backfill_round += 1
+
+    if len(binaries) < want and (os.getenv("GMI_EXTRA_IMAGES_PLACEHOLDER") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        shortfall = want - len(binaries)
+        ref_fill = source_for_generation.read_bytes()
+        while len(binaries) < want:
+            binaries.append(ref_fill)
+        if warnings is not None:
+            warnings.append(
+                f"extra_images_placeholder: RQ model {model!r} returned no images; copied reference image "
+                f"for {shortfall} slot(s) (not real marketing variants)."
+            )
+            warnings.append(
+                "extra_images_placeholder_note: Distinct prompts were still sent per slot (different angle studio / "
+                "different application scenario no person / person-in-use lifestyle). Identical files mean the API "
+                "yielded no decodable image bytes, not that one prompt was reused. Set GMI_EXTRA_IMAGES_DEBUG=1 to append "
+                "per-request prompt digests (sha + length + head) to these warnings. Set GMI_RQ_OUTCOME_DEBUG=1 to print "
+                "RQ outcome field shapes on stderr when decode fails (compare with console docs / support)."
+            )
+
     paths: List[str] = []
-    for i, b in enumerate(binaries[:count], start=1):
-        p = out_dir / f"{product_id}_extra_{i}.png"
+    for j, b in enumerate(binaries[:want]):
+        p = out_dir / f"{product_id}_extra_{start_idx + j}.png"
         p.write_bytes(b)
         paths.append(str(p))
     return paths
@@ -729,12 +1481,93 @@ def run_step2_enhance_local(
     return final_path
 
 
+def run_listing_reference_consistency_audit(
+    chat: ChatClient,
+    model: str,
+    original_listing_image: Path,
+    marketing_variant_image: Path,
+    warnings: List[str],
+) -> Dict[str, Any]:
+    """Compare original listing photo vs first marketing extra; gate using variant for copy/vision."""
+    if chat.mock:
+        return {
+            "same_core_product": True,
+            "confidence": "high",
+            "drift_notes": "",
+            "safe_to_use_variant_for_copy": True,
+        }
+    prompt = """
+You compare two ecommerce images for the SAME SKU pipeline.
+
+Image A: original seller listing photo (may have watermarks/overlays).
+Image B: AI marketing render (different angle/staging; should show the same product).
+
+Return JSON only:
+{
+  "same_core_product": boolean,
+  "confidence": "low" | "medium" | "high",
+  "drift_notes": "English: what changed between A and B (pose, accessories, color drift, wrong object, etc.)",
+  "safe_to_use_variant_for_copy": boolean
+}
+
+Rules:
+- safe_to_use_variant_for_copy = true only if B clearly depicts the same product category and identity as A (allow angle/lighting/staging changes).
+- If B shows a different product, different colorway not in A, or invented accessories, set same_core_product false and safe_to_use_variant_for_copy false.
+- If unsure, prefer safe_to_use_variant_for_copy false.
+""".strip()
+    try:
+        data = chat.chat_json(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You audit listing vs marketing image consistency. JSON only."},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Image A (original listing):\n" + prompt},
+                        {"type": "image_url", "image_url": {"url": path_to_data_url(original_listing_image)}},
+                        {"type": "text", "text": "Image B (marketing variant extra_1):"},
+                        {"type": "image_url", "image_url": {"url": path_to_data_url(marketing_variant_image)}},
+                    ],
+                },
+            ],
+            max_tokens=700,
+            temperature=0.1,
+        )
+    except Exception as exc:
+        warnings.append(f"listing_reference_audit_failed: {exc}")
+        return {
+            "same_core_product": False,
+            "confidence": "low",
+            "drift_notes": str(exc),
+            "safe_to_use_variant_for_copy": False,
+        }
+    if not isinstance(data, dict):
+        warnings.append("listing_reference_audit_malformed")
+        return {
+            "same_core_product": False,
+            "confidence": "low",
+            "drift_notes": "non-dict response",
+            "safe_to_use_variant_for_copy": False,
+        }
+    safe = bool(data.get("safe_to_use_variant_for_copy", False)) and bool(data.get("same_core_product", False))
+    out = {
+        "same_core_product": bool(data.get("same_core_product", False)),
+        "confidence": str(data.get("confidence", "low")).strip().lower(),
+        "drift_notes": str(data.get("drift_notes", "")).strip(),
+        "safe_to_use_variant_for_copy": safe,
+    }
+    if out["confidence"] not in {"low", "medium", "high"}:
+        out["confidence"] = "low"
+    return out
+
+
 def run_step3_understand_product(
     chat: ChatClient,
     model: str,
     product_id: str,
-    source_image: Path,
+    vision_image: Path,
     extracted_text: List[str],
+    image_context: str = "clean_main",
 ) -> Dict[str, Any]:
     if chat.mock:
         return {
@@ -747,35 +1580,68 @@ def run_step3_understand_product(
             "confidence": "low",
         }
     text_list = "\n".join(f"- {t}" for t in extracted_text)
-    prompt = f"""
-You are a product analyst for cross-border ecommerce.
-Source language: Chinese (with possible letters/numbers).
+    if image_context == "original_raw":
+        image_desc = (
+            "Attached image: **original seller listing** (may still show overlays, watermarks, promos). "
+            "Read both pixels and on-image text; OCR list below is the MTWI transcript of those regions."
+        )
+    elif image_context == "marketing_variant":
+        image_desc = (
+            "Attached image: **marketing variant** of the SAME SKU (angle/staging may differ from the raw listing). "
+            "Infer attributes from visible product pixels; ignore pure background staging. "
+            "Cross-check with OCR from the source listing; do not invent specs not supported by image + OCR."
+        )
+    else:
+        image_context = "clean_main"
+        image_desc = (
+            "Attached image: **cleaned main product photo** (promotional text from the original listing was removed or inpainted). "
+            "The OCR list is the **verbatim transcript** of text that appeared on the **original** image (Chinese + Latin/numbers); use it to recover brand, model, power, bundle claims, and product naming. "
+            "Reconcile: printed specs visible on the product/box in this image should align with OCR when they refer to the same SKU."
+        )
 
-Given:
-- product_id: {product_id}
-- image (original image with text)
-- OCR text list:
+    prompt = f"""
+## Your role
+You are a **multimodal product analyst** for cross-border ecommerce. Your job is to fuse **what you see in the image** with **the OCR transcript** (text that was on the seller listing, including Chinese marketing lines) into one strict JSON object for downstream Canadian English/French copywriters.
+
+## Inputs
+- **product_id**: `{product_id}`
+- **Image context**: {image_desc}
+- **OCR transcript** (from MTWI boxes on the original listing; may contain duplicates or noise):
 {text_list}
 
-Task:
-Infer structured product attributes with conservative assumptions.
-If a brand/series is Chinese-only, output it in Latin letters (pinyin or a reasonable romanization).
-Return JSON only with keys:
-- product_type (string)
-- category_hint (string)
-- material (string)
-- key_features (string[])
-- size_or_specs (string[])
-- brand_or_series (string)
-- confidence (one of: low, medium, high)
+## Reasoning rules
+1. **Vision first**: Identify the main sellable item, accessories in frame, packaging, and any legible print on the product or box.
+2. **OCR as structured hints**: Map Chinese trade terms to English concepts (e.g. 吹风机 / 电吹风 / 专业吹风机 → hair dryer). Use Latin/numbers for model IDs and wattage.
+3. **No lazy defaults**: Do not emit `product_type: "Unknown"` when the category is clear from shape + OCR. Reserve `confidence: "low"` only when the image is ambiguous *and* OCR is unhelpful.
+4. **Conservative facts**: Do not invent certifications, awards, or medical claims not visible or stated in OCR.
+
+## Output format (JSON only, no markdown fences)
+Return exactly these keys (all required):
+| Key | Type | Requirements |
+|-----|------|--------------|
+| product_type | string | **English** short noun phrase for the main item (e.g. `hair dryer`). From pixels + OCR. |
+| category_hint | string | **English** retail path with ` > ` (e.g. `Beauty & Personal Care > Hair Care > Hair Dryers`). |
+| material | string | **English**; empty string if not inferable. |
+| key_features | string[] | 3–12 **English** bullets derived from image + OCR (brand, model, power, in-box items, key promos translated to factual English). |
+| size_or_specs | string[] | **English** measurable specs (wattage, dimensions if visible, etc.); empty array if none. |
+| brand_or_series | string | **Latin**; pinyin/romanization if Chinese-only in OCR. |
+| confidence | string | One of: `low`, `medium`, `high` — your certainty after fusing image + OCR.
 """.strip()
     messages = [
-        {"role": "system", "content": "You extract structured product attributes from image + OCR cues."},
+        {
+            "role": "system",
+            "content": (
+                "You are a multimodal ecommerce product analyst. You MUST output a single JSON object with the exact keys "
+                "requested in the user message. product_type, category_hint, material, key_features, size_or_specs, and "
+                "brand_or_series are always grounded in the provided image plus OCR; use English for all string/array "
+                "values except confidence."
+            ),
+        },
         {
             "role": "user",
             "content": [
                 {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": path_to_data_url(source_image)}},
+                {"type": "image_url", "image_url": {"url": path_to_data_url(vision_image)}},
             ],
         },
     ]
@@ -791,6 +1657,181 @@ Operator requirements for tone, audience, bullets, length, SEO keywords, or bran
 """
 
 
+_STEP4_PRODUCT_ID_RULES = """
+Product identification (critical):
+- Infer the physical product type from **the image**, structured JSON, **and** OCR together. OCR may be Chinese: interpret trade terms (e.g. 吹风机 / 电吹风 / 专业吹风机 → hair dryer).
+- If product_type is blank, "Unknown", or too generic, infer the specific category from pixels + OCR + key_features — do not write vague "general merchandise" copy.
+- Title and the opening of the description must name the item type clearly in the target language (e.g. English: "hair dryer"; French: "séchoir à cheveux").
+"""
+
+_STEP4_INPUTS_CONTRACT = """
+## Inputs you receive
+1. **IMAGE** — Product photo used for this listing (typically after overlay text removal). Use it to confirm shape, colour, accessories, packaging, and printed specs on the product.
+2. **STRUCTURED JSON** — Output of an earlier vision analyst step; treat as machine hints. If it conflicts with the image or OCR, **prefer image + OCR**.
+3. **OCR TRANSCRIPT** — Verbatim strings from the **original** listing image regions (often Chinese + numbers/Latin). These are the **removed overlay texts**; use them for model numbers, wattage, bundle contents, brand names (romanize in output), and product naming.
+"""
+
+_STEP4_OUTPUT_FIELD_SPECS = """
+## Per-field output requirements (must satisfy all that apply)
+- **title**: One line; **must** include the product type; add brand or model when supported by image/OCR; aim ~50–120 characters.
+- **description**: Multi-sentence factual prose (or short implied bullets); weave visible features and OCR-backed specs; no Chinese characters; no internal labels like "OCR:" or "confidence".
+- **category**: Retail path using ` > `; labels entirely in the **target locale** (Canadian English or Canadian French).
+- **key_attributes**: Flat object, **4–12** entries where possible (e.g. brand, model, power, colour_family, in_the_box); values only in the target locale; romanize Chinese brands.
+"""
+
+
+def _step4_use_listing_image(listing_image: Optional[Path]) -> Optional[Path]:
+    """Attach product image to Step4 unless GMI_STEP4_COPY_USE_IMAGE disables it."""
+    if listing_image is None or not listing_image.is_file():
+        return None
+    v = (os.getenv("GMI_STEP4_COPY_USE_IMAGE") or "1").strip().lower()
+    if v in ("0", "false", "no", "off"):
+        return None
+    return listing_image
+
+
+def _step4_user_message_content(prompt_text: str, listing_image: Optional[Path]) -> Any:
+    img = _step4_use_listing_image(listing_image)
+    if img is None:
+        return prompt_text
+    return [
+        {"type": "text", "text": prompt_text},
+        {"type": "image_url", "image_url": {"url": path_to_data_url(img)}},
+    ]
+
+
+# Fixed bilingual listing parameters (JSON keys); missing values → locale sentinel after parse.
+LISTING_PARAMETER_KEYS: Tuple[str, ...] = (
+    "brand",
+    "model",
+    "product_type",
+    "power",
+    "colour",
+    "material",
+    "dimensions",
+    "included_accessories",
+    "certifications_visible",
+    "country_of_origin",
+    "warranty",
+    "weight",
+)
+STEP4_PARAM_MISSING_EN = "Not specified"
+STEP4_PARAM_MISSING_FR = "Non précisé"
+
+
+def _step4_dual_image_paths_ok(
+    source_image: Optional[Path],
+    cleaned_image: Optional[Path],
+) -> Tuple[Optional[Path], Optional[Path]]:
+    """Return paths for multimodal listing when GMI_STEP4_COPY_USE_IMAGE allows."""
+    if (os.getenv("GMI_STEP4_COPY_USE_IMAGE") or "1").strip().lower() in ("0", "false", "no", "off"):
+        return None, None
+    src = source_image if source_image and source_image.is_file() else None
+    cln = cleaned_image if cleaned_image and cleaned_image.is_file() else None
+    return src, cln
+
+
+def _step4_user_message_content_dual(
+    prompt_text: str,
+    source_image: Optional[Path],
+    cleaned_image: Optional[Path],
+    warnings: Optional[List[str]] = None,
+) -> Any:
+    """Multimodal user body: text then unique image URL(s): original listing, then cleaned (order matches prompt)."""
+    src, cln = _step4_dual_image_paths_ok(source_image, cleaned_image)
+    if src is None and cln is None:
+        return prompt_text
+    parts: List[Dict[str, Any]] = [{"type": "text", "text": prompt_text}]
+    seen: set[str] = set()
+    for p in (src, cln):
+        if p is None:
+            continue
+        url = path_to_data_url(p)
+        if url in seen:
+            continue
+        seen.add(url)
+        parts.append({"type": "image_url", "image_url": {"url": url}})
+    if warnings is not None:
+        if src is None:
+            warnings.append("step4_dual_image_missing_original: cleaned-only or no listing image for multimodal")
+        if cln is None:
+            warnings.append("step4_dual_image_missing_cleaned: original-only multimodal")
+    return parts
+
+
+def _step4_max_tokens() -> int:
+    try:
+        return max(600, int(os.getenv("GMI_STEP4_MAX_TOKENS", "2048")))
+    except ValueError:
+        return 2048
+
+
+def _parse_delimited_step4_text(text: str) -> Dict[str, Any]:
+    """Parse TITLE:/CATEGORY:/DESCRIPTION:…/END_DESCRIPTION/KEY_ATTR_* lines."""
+    raw = text.replace("\r\n", "\n")
+    title = ""
+    category = ""
+    desc_lines: List[str] = []
+    attrs: Dict[str, str] = {}
+    mode: Optional[str] = None
+    for line in raw.split("\n"):
+        stripped = line.strip()
+        u = stripped
+        if re.match(r"(?i)^TITLE:\s*", u):
+            title = re.split(r":\s*", u, 1)[1].strip() if ":" in u else ""
+            mode = None
+        elif re.match(r"(?i)^CATEGORY:\s*", u):
+            category = re.split(r":\s*", u, 1)[1].strip() if ":" in u else ""
+            mode = None
+        elif re.match(r"(?i)^DESCRIPTION:\s*", u):
+            rest = re.split(r":\s*", u, 1)[1].strip() if ":" in u else ""
+            desc_lines = [rest] if rest else []
+            mode = "desc"
+        elif re.match(r"(?i)^END_DESCRIPTION\s*$", u):
+            mode = None
+        elif mode == "desc":
+            desc_lines.append(line.rstrip())
+        elif re.match(r"(?i)^KEY_ATTR_", u):
+            m = re.match(r"(?i)^KEY_ATTR_([^:]+):\s*(.*)$", u)
+            if m:
+                attrs[m.group(1).strip()] = m.group(2).strip()
+    description = "\n".join(desc_lines).strip()
+    return {"title": title, "category": category, "description": description, "key_attributes": attrs}
+
+
+def _coerce_step4_locale_block(payload: Dict[str, Any], listing_key: str) -> Dict[str, Any]:
+    """Accept common JSON shapes when models ignore the exact top-level key name."""
+    if not isinstance(payload, dict):
+        return {}
+    direct = payload.get(listing_key)
+    if isinstance(direct, dict):
+        return direct
+    norm_target = listing_key.lower().replace("-", "_")
+    for k, v in payload.items():
+        if not isinstance(k, str) or not isinstance(v, dict):
+            continue
+        if k.lower().replace("-", "_") == norm_target:
+            return v
+    for wrap in ("result", "data", "output", "response", "listing", "copy"):
+        inner = payload.get(wrap)
+        if isinstance(inner, dict):
+            nested = _coerce_step4_locale_block(inner, listing_key)
+            if nested:
+                return nested
+    if len(payload) == 1:
+        _, sole_v = next(iter(payload.items()))
+        if isinstance(sole_v, dict):
+            if any(x in sole_v for x in ("title", "description", "category", "key_attributes")):
+                return sole_v
+            nk = sole_v.get(listing_key)
+            if isinstance(nk, dict):
+                return nk
+    for v in payload.values():
+        if isinstance(v, dict) and (v.get("title") or v.get("description")):
+            return v
+    return {}
+
+
 def run_step4_generate_copy_language(
     chat: ChatClient,
     model: str,
@@ -798,8 +1839,13 @@ def run_step4_generate_copy_language(
     extracted_text: List[str],
     user_copy_instructions: str,
     target: Literal["canadian_english", "canadian_french"],
+    listing_image: Optional[Path] = None,
 ) -> LocalizedListing:
-    """Generate one locale listing (Canadian English or Canadian French) with a dedicated model."""
+    """Generate one locale listing (Canadian English or Canadian French) with a dedicated model.
+
+    When ``listing_image`` is set (default: same frame as Step3), the model receives **image + JSON + OCR**
+    so copy is grounded in pixels and removed overlay text.
+    """
     lang_name = "Canadian English" if target == "canadian_english" else "Canadian French (français canadien)"
     listing_key = target
     if chat.mock:
@@ -821,47 +1867,325 @@ def run_step4_generate_copy_language(
     ocr_text = "\n".join(f"- {t}" for t in extracted_text[:20])
     operator_block = _step4_operator_block(user_copy_instructions)
     prompt = f"""
-You are an ecommerce localization copywriter for Canada.
-Source language: Chinese. Target output language: {lang_name} only.
+## Your role
+You are a **senior ecommerce copywriter** preparing a listing for **{lang_name}** shoppers in Canada (marketplace-style).
 
-Inputs:
-Structured attributes:
+## Task
+Produce **one** JSON object with a single top-level key `{listing_key}`. Every factual claim must be grounded in **the product image**, the structured JSON, and the OCR transcript (removed overlay text from the source listing). Source signals include Chinese; **output strings must contain no Chinese characters** (romanize or omit brands).
+
+{_STEP4_INPUTS_CONTRACT}
+
+## Structured attributes (from prior vision step)
+```json
 {attrs_text}
+```
 
-OCR text clues:
+## OCR transcript (verbatim from original listing regions)
 {ocr_text}
+
+{_STEP4_PRODUCT_ID_RULES}
+{_STEP4_OUTPUT_FIELD_SPECS}
 {operator_block}
-Output JSON only with a single top-level key "{listing_key}":
+
+## Output format (JSON only — no markdown fences)
+Return exactly:
 {{
   "{listing_key}": {{
     "title": "string",
     "description": "string",
-    "category": "string category path",
-    "key_attributes": {{"key":"value"}}
+    "category": "string",
+    "key_attributes": {{"key": "value"}}
   }}
 }}
 
-Rules:
-- All string values in that object must be in the target language only ({lang_name}).
-- Do not include ANY Chinese characters in output text fields (including brand names).
-  If the input contains Chinese brand/series, romanize it (pinyin) or omit it.
-- Do not include URLs, seller claims, or watermark-related phrases.
-- Be factual and conservative; no invented claims.
+## Hard rules
+- All string values inside `{listing_key}` must be **{lang_name}** only.
+- No URLs, no "free shipping/authentic" seller hype unless OCR explicitly supports a neutral factual restatement.
+- No invented certifications, awards, or medical claims.
 """.strip()
+    user_body = _step4_user_message_content(prompt, listing_image)
     data = chat.chat_json(
         model=model,
         messages=[
             {
                 "role": "system",
-                "content": f"You generate factual {lang_name} ecommerce copy as strict JSON only.",
+                "content": (
+                    f"You are a senior ecommerce copywriter for {lang_name} (Canada). "
+                    "You may receive a product image plus JSON and OCR; ground the listing in those sources. "
+                    "Reply with strict JSON only — one top-level key as specified by the user."
+                ),
             },
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": user_body},
         ],
-        max_tokens=900,
+        max_tokens=_step4_max_tokens(),
         temperature=0.3,
     )
     label = "English" if target == "canadian_english" else "French"
-    return build_listing(data if isinstance(data, dict) else {}, listing_key, label)
+    data_dict = data if isinstance(data, dict) else {}
+    block = _coerce_step4_locale_block(data_dict, listing_key)
+    listing = build_listing({listing_key: block} if block else data_dict, listing_key, label)
+    if not chat.mock and _step4_copy_listing_degenerate(listing):
+        plain_listing = _step4_try_plaintext_listing(
+            chat=chat,
+            model=model,
+            structured_attributes=structured_attributes,
+            extracted_text=extracted_text,
+            user_copy_instructions=user_copy_instructions,
+            target=target,
+            listing_image=listing_image,
+        )
+        if plain_listing is not None:
+            listing = plain_listing
+    if not chat.mock and _step4_copy_listing_degenerate(listing):
+        raise RuntimeError(
+            f"step4_degenerate_listing: locale={target} title={listing.title!r} description_empty=True"
+        )
+    return listing
+
+
+def _step4_copy_listing_degenerate(listing: LocalizedListing) -> bool:
+    """True if the model output did not yield usable body copy (triggers fallback model)."""
+    return not (listing.description or "").strip()
+
+
+def _step4_try_plaintext_listing(
+    chat: ChatClient,
+    model: str,
+    structured_attributes: Dict[str, Any],
+    extracted_text: List[str],
+    user_copy_instructions: str,
+    target: Literal["canadian_english", "canadian_french"],
+    listing_image: Optional[Path] = None,
+) -> Optional[LocalizedListing]:
+    """If JSON copy fails, ask for line-delimited fields (no response_format)."""
+    if chat.mock:
+        return None
+    listing_key = target
+    lang_name = "Canadian English" if target == "canadian_english" else "Canadian French (français canadien)"
+    attrs_text = json.dumps(structured_attributes, ensure_ascii=False, indent=2)
+    ocr_text = "\n".join(f"- {t}" for t in extracted_text[:20])
+    operator_block = _step4_operator_block(user_copy_instructions)
+    prompt = f"""## Your role
+You are a **senior ecommerce copywriter** for **{lang_name}** (Canada). You see the **product image**, structured context, and **OCR transcript** (text removed from the original listing). Ground the listing in those sources.
+
+{_STEP4_INPUTS_CONTRACT}
+
+## Structured context
+{attrs_text}
+
+## OCR transcript
+{ocr_text}
+{_STEP4_PRODUCT_ID_RULES}
+{_STEP4_OUTPUT_FIELD_SPECS}
+{operator_block}
+
+## Output shape (plain text only — no JSON, no markdown fences)
+TITLE: <single line>
+CATEGORY: <single line>
+DESCRIPTION: <one or more lines of body copy>
+END_DESCRIPTION
+(Optional) KEY_ATTR_name: value
+
+Use END_DESCRIPTION on its own line after the description."""
+    user_body = _step4_user_message_content(prompt, listing_image)
+    plain = chat.chat_plain(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    f"You write factual {lang_name} ecommerce copy in the exact line format requested. "
+                    "Use the image plus OCR when provided. No JSON."
+                ),
+            },
+            {"role": "user", "content": user_body},
+        ],
+        max_tokens=_step4_max_tokens(),
+        temperature=0.35,
+        response_json_object=False,
+    )
+    parsed = _parse_delimited_step4_text(plain)
+    desc = (parsed.get("description") or "").strip()
+    if not desc:
+        return None
+    block = {
+        "title": parsed.get("title") or "",
+        "description": desc,
+        "category": parsed.get("category") or "",
+        "key_attributes": parsed.get("key_attributes") or {},
+    }
+    label = "English" if target == "canadian_english" else "French"
+    listing = build_listing({listing_key: block}, listing_key, label)
+    if _step4_copy_listing_degenerate(listing):
+        return None
+    return listing
+
+
+def _listing_is_heuristic_fallback(listing: LocalizedListing, locale: Literal["en", "fr"]) -> bool:
+    attrs = listing.key_attributes or {}
+    if locale == "en":
+        return str(attrs.get("draft_source", "")).lower() == "heuristic_en"
+    return str(attrs.get("source_brouillon", "")).lower() == "heuristique_fr"
+
+
+def _listings_need_simple_copy_recovery(en: LocalizedListing, fr: LocalizedListing) -> bool:
+    """Split-model path produced empty body or heuristic drafts — try one-shot bilingual JSON."""
+    if not (en.description or "").strip() or not (fr.description or "").strip():
+        return True
+    return _listing_is_heuristic_fallback(en, "en") or _listing_is_heuristic_fallback(fr, "fr")
+
+
+def run_step4_generate_copy_bilingual_simple(
+    chat: ChatClient,
+    model: str,
+    structured_attributes: Dict[str, Any],
+    extracted_text: List[str],
+    user_copy_instructions: str,
+    listing_image: Optional[Path] = None,
+) -> Tuple[LocalizedListing, LocalizedListing]:
+    """Single-chat EN+FR listing (simpler for gateways); never requests response_format json_object.
+
+    Pass ``listing_image`` (same frame as Step3 by default) so the model grounds bilingual copy in pixels + OCR.
+    """
+    if chat.mock:
+        return (
+            LocalizedListing(
+                title="Mock: Product title in Canadian English",
+                description="Mock: Product description in Canadian English (simple bilingual call).",
+                category="Mock: Category > Subcategory",
+                key_attributes={"feature_1": "mock", "draft_source": "simple_bilingual"},
+            ),
+            LocalizedListing(
+                title="Maquette : Titre produit en francais canadien",
+                description="Maquette : Description (appel bilingue simple).",
+                category="Maquette : Categorie > Sous-categorie",
+                key_attributes={"caracteristique_1": "maquette", "source_brouillon": "simple_bilingue"},
+            ),
+        )
+
+    attrs_text = json.dumps(structured_attributes, ensure_ascii=False, indent=2)
+    ocr_text = "\n".join(f"- {t}" for t in extracted_text[:20])
+    operator_block = _step4_operator_block(user_copy_instructions)
+    prompt = f"""
+## Your role
+You are a **bilingual ecommerce localization lead** for **Canada**. You produce **Canadian English** and **Canadian French** listing copy in **one** JSON object.
+
+## Task
+Ground both locales in **the product image**, structured JSON, and OCR (removed overlay text). Chinese appears only in inputs — **no Chinese in output strings**.
+
+{_STEP4_INPUTS_CONTRACT}
+
+## Structured attributes (prior vision step)
+```json
+{attrs_text}
+```
+
+## OCR transcript
+{ocr_text}
+
+{_STEP4_PRODUCT_ID_RULES}
+{_STEP4_OUTPUT_FIELD_SPECS}
+{operator_block}
+
+## Output format (JSON only — no markdown fences)
+Return **one** JSON object with **exactly** these top-level keys:
+- `"canadian_english"`: object with `title`, `description`, `category`, `key_attributes` (all **English** strings).
+- `"canadian_french"`: same keys, all **Canadian French** strings.
+
+## Hard rules
+- Same factual content in both languages (no extra claims in one locale).
+- Romanize Chinese brand names; do not copy Chinese characters into outputs.
+- No URLs; no invented certifications.
+""".strip()
+    user_body = _step4_user_message_content(prompt, listing_image)
+    data = chat.chat_json(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You reply with a single JSON object only. Top-level keys: canadian_english, canadian_french. "
+                    "You may receive a product image plus JSON and OCR — ground copy in those sources. No markdown fences."
+                ),
+            },
+            {"role": "user", "content": user_body},
+        ],
+        max_tokens=min(4096, _step4_max_tokens() + 1024),
+        temperature=0.25,
+        response_json_object=False,
+    )
+    data_dict = data if isinstance(data, dict) else {}
+    en_block = _coerce_step4_locale_block(data_dict, "canadian_english")
+    fr_block = _coerce_step4_locale_block(data_dict, "canadian_french")
+    en = build_listing({"canadian_english": en_block}, "canadian_english", "English")
+    fr = build_listing({"canadian_french": fr_block}, "canadian_french", "French")
+    attrs_en = dict(en.key_attributes)
+    attrs_en.setdefault("draft_source", "simple_bilingual")
+    attrs_fr = dict(fr.key_attributes)
+    attrs_fr.setdefault("source_brouillon", "simple_bilingue")
+    return (
+        LocalizedListing(
+            title=en.title,
+            description=en.description,
+            category=en.category,
+            key_attributes=attrs_en,
+        ),
+        LocalizedListing(
+            title=fr.title,
+            description=fr.description,
+            category=fr.category,
+            key_attributes=attrs_fr,
+        ),
+    )
+
+
+def _apply_simple_copy_recovery_if_needed(
+    chat: ChatClient,
+    args: argparse.Namespace,
+    structured: Dict[str, Any],
+    extracted: List[str],
+    user_copy_resolved: str,
+    en: LocalizedListing,
+    fr: LocalizedListing,
+    warnings: List[str],
+    listing_image: Optional[Path] = None,
+) -> Tuple[LocalizedListing, LocalizedListing]:
+    if getattr(args, "no_simple_copy_recovery", False) or chat.mock:
+        return en, fr
+    if not _listings_need_simple_copy_recovery(en, fr):
+        return en, fr
+    try:
+        en2, fr2 = run_step4_generate_copy_bilingual_simple(
+            chat=chat,
+            model=args.simple_copy_model,
+            structured_attributes=structured,
+            extracted_text=extracted,
+            user_copy_instructions=user_copy_resolved,
+            listing_image=listing_image,
+        )
+    except Exception as exc:
+        warnings.append(f"step4_simple_bilingual_recovery_failed: {exc}")
+        return en, fr
+
+    ok_en = not _step4_copy_listing_degenerate(en2)
+    ok_fr = not _step4_copy_listing_degenerate(fr2)
+    en_bad = _listing_is_heuristic_fallback(en, "en") or not (en.description or "").strip()
+    fr_bad = _listing_is_heuristic_fallback(fr, "fr") or not (fr.description or "").strip()
+
+    replaced: List[str] = []
+    if ok_en and en_bad:
+        en = en2
+        replaced.append("en")
+    if ok_fr and fr_bad:
+        fr = fr2
+        replaced.append("fr")
+    if replaced:
+        warnings.append(
+            f"step4_simple_bilingual_recovery_ok: model={args.simple_copy_model} replaced={'+'.join(replaced)}"
+        )
+    else:
+        warnings.append("step4_simple_bilingual_recovery_no_improvement: kept prior listings")
+    return en, fr
 
 
 def _normalize_copy_review(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -1122,59 +2446,78 @@ def run_step4b_review_copy_bilingual(
             False,
         )
 
-    failed = False
-    try:
-        en_raw = _run_step4b_review_copy_one_language(
-            chat,
-            model_english,
-            product_id,
-            source_image,
-            structured_attributes,
-            en,
-            "Canadian English",
-            audit_english=True,
-            user_copy_instructions=user_copy_instructions,
-        )
-    except Exception:
-        failed = True
-        en_raw = _normalize_copy_review(
-            {
-                "overall_status": "revise",
-                "summary": "English copy reviewer call failed.",
-                "exaggeration_findings": [],
-                "attribute_conflicts": [],
-                "image_visual_mismatches": [],
-                "en_revision_suggestions": "",
-                "fr_revision_suggestions": "",
-                "scores": {},
-            }
-        )
-    try:
-        fr_raw = _run_step4b_review_copy_one_language(
-            chat,
-            model_french,
-            product_id,
-            source_image,
-            structured_attributes,
-            fr,
-            "Canadian French",
-            audit_english=False,
-            user_copy_instructions=user_copy_instructions,
-        )
-    except Exception:
-        failed = True
-        fr_raw = _normalize_copy_review(
-            {
-                "overall_status": "revise",
-                "summary": "French copy reviewer call failed.",
-                "exaggeration_findings": [],
-                "attribute_conflicts": [],
-                "image_visual_mismatches": [],
-                "en_revision_suggestions": "",
-                "fr_revision_suggestions": "",
-                "scores": {},
-            }
-        )
+    def _en_side() -> Tuple[Dict[str, Any], bool]:
+        try:
+            return (
+                _run_step4b_review_copy_one_language(
+                    chat,
+                    model_english,
+                    product_id,
+                    source_image,
+                    structured_attributes,
+                    en,
+                    "Canadian English",
+                    audit_english=True,
+                    user_copy_instructions=user_copy_instructions,
+                ),
+                False,
+            )
+        except Exception:
+            return (
+                _normalize_copy_review(
+                    {
+                        "overall_status": "revise",
+                        "summary": "English copy reviewer call failed.",
+                        "exaggeration_findings": [],
+                        "attribute_conflicts": [],
+                        "image_visual_mismatches": [],
+                        "en_revision_suggestions": "",
+                        "fr_revision_suggestions": "",
+                        "scores": {},
+                    }
+                ),
+                True,
+            )
+
+    def _fr_side() -> Tuple[Dict[str, Any], bool]:
+        try:
+            return (
+                _run_step4b_review_copy_one_language(
+                    chat,
+                    model_french,
+                    product_id,
+                    source_image,
+                    structured_attributes,
+                    fr,
+                    "Canadian French",
+                    audit_english=False,
+                    user_copy_instructions=user_copy_instructions,
+                ),
+                False,
+            )
+        except Exception:
+            return (
+                _normalize_copy_review(
+                    {
+                        "overall_status": "revise",
+                        "summary": "French copy reviewer call failed.",
+                        "exaggeration_findings": [],
+                        "attribute_conflicts": [],
+                        "image_visual_mismatches": [],
+                        "en_revision_suggestions": "",
+                        "fr_revision_suggestions": "",
+                        "scores": {},
+                    }
+                ),
+                True,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_en = pool.submit(_en_side)
+        f_fr = pool.submit(_fr_side)
+        en_raw, en_failed = f_en.result()
+        fr_raw, fr_failed = f_fr.result()
+    failed = en_failed or fr_failed
     merged = _merge_copy_reviews_bilingual(en_raw, fr_raw)
     return merged, failed
 
@@ -1226,13 +2569,18 @@ def run_step4c_locale_grammar_review(
     model_french: str,
     en: LocalizedListing,
     fr: LocalizedListing,
-) -> Dict[str, Any]:
-    """Two text-only reviewers: Canadian English and Canadian French grammar/conventions (separate models)."""
+) -> Tuple[Dict[str, Any], bool]:
+    """Two text-only reviewers: Canadian English and Canadian French grammar/conventions (separate models).
+
+    Returns ``(review_dict, any_side_call_failed)``. Per-language ``chat_json`` errors are caught so one
+    side can succeed while the other fails (same resilience pattern as Step4b). Previously, either
+    side raising aborted the whole step and the pipeline duplicated one exception into both locales.
+    """
     if chat.mock:
         ok = _normalize_locale_grammar_block(
             {"status": "pass", "issues": [], "suggested_edits": "", "notes": "Mock: skipped."}
         )
-        return {"canadian_english": ok, "canadian_french": {**ok}}
+        return {"canadian_english": ok, "canadian_french": {**ok}}, False
 
     en_json = json.dumps(asdict(en), ensure_ascii=False, indent=2)
     en_prompt = f"""
@@ -1258,17 +2606,6 @@ Rules:
 - issues entries should be short and specific (field + problem).
 """.strip()
 
-    en_raw = chat.chat_json(
-        model=model_english,
-        messages=[
-            {"role": "system", "content": "You are a Canadian English editor. Output strict JSON only."},
-            {"role": "user", "content": en_prompt},
-        ],
-        max_tokens=900,
-        temperature=0.1,
-    )
-    en_block = _normalize_locale_grammar_block(en_raw if isinstance(en_raw, dict) else {})
-
     fr_json = json.dumps(asdict(fr), ensure_ascii=False, indent=2)
     fr_prompt = f"""
 You are a Canadian French (français canadien) copy editor for ecommerce listings in Canada.
@@ -1293,29 +2630,110 @@ Rules:
 - issues can be written in French.
 """.strip()
 
-    fr_raw = chat.chat_json(
-        model=model_french,
-        messages=[
-            {"role": "system", "content": "You are a Canadian French editor. Output strict JSON only."},
-            {"role": "user", "content": fr_prompt},
-        ],
-        max_tokens=900,
-        temperature=0.1,
-    )
-    fr_block = _normalize_locale_grammar_block(fr_raw if isinstance(fr_raw, dict) else {})
+    def _en_block() -> Tuple[Dict[str, Any], bool]:
+        try:
+            en_raw = chat.chat_json(
+                model=model_english,
+                messages=[
+                    {"role": "system", "content": "You are a Canadian English editor. Output strict JSON only."},
+                    {"role": "user", "content": en_prompt},
+                ],
+                max_tokens=900,
+                temperature=0.1,
+            )
+            return _normalize_locale_grammar_block(en_raw if isinstance(en_raw, dict) else {}), False
+        except Exception as exc:
+            return (
+                _normalize_locale_grammar_block(
+                    {
+                        "status": "revise",
+                        "issues": [str(exc)],
+                        "suggested_edits": "",
+                        "notes": "Canadian English locale grammar reviewer call failed.",
+                    }
+                ),
+                True,
+            )
 
-    return {"canadian_english": en_block, "canadian_french": fr_block}
+    def _fr_block() -> Tuple[Dict[str, Any], bool]:
+        try:
+            fr_raw = chat.chat_json(
+                model=model_french,
+                messages=[
+                    {"role": "system", "content": "You are a Canadian French editor. Output strict JSON only."},
+                    {"role": "user", "content": fr_prompt},
+                ],
+                max_tokens=900,
+                temperature=0.1,
+            )
+            return _normalize_locale_grammar_block(fr_raw if isinstance(fr_raw, dict) else {}), False
+        except Exception as exc:
+            return (
+                _normalize_locale_grammar_block(
+                    {
+                        "status": "revise",
+                        "issues": [str(exc)],
+                        "suggested_edits": "",
+                        "notes": "Canadian French locale grammar reviewer call failed.",
+                    }
+                ),
+                True,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_en = pool.submit(_en_block)
+        f_fr = pool.submit(_fr_block)
+        en_block, en_failed = f_en.result()
+        fr_block, fr_failed = f_fr.result()
+
+    return {"canadian_english": en_block, "canadian_french": fr_block}, (en_failed or fr_failed)
 
 
 def parse_json_content(content: Any) -> Dict[str, Any]:
     if isinstance(content, dict):
         return content
-    if isinstance(content, str):
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            return {}
-    return {}
+    if not isinstance(content, str):
+        return {}
+    s = _strip_thinking_wrappers(content.strip())
+    if not s:
+        return {}
+    # Strip ```json ... ``` fences (common when response_format is ignored or unsupported)
+    if "```" in s:
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", s, re.IGNORECASE)
+        if m:
+            s = m.group(1).strip()
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
+        if isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, dict):
+                    return item
+        return {}
+    except json.JSONDecodeError:
+        pass
+    # First JSON value in string (object or array)
+    idx_obj = s.find("{")
+    idx_arr = s.find("[")
+    idx = -1
+    if idx_obj >= 0 and (idx_arr < 0 or idx_obj < idx_arr):
+        idx = idx_obj
+    elif idx_arr >= 0:
+        idx = idx_arr
+    if idx < 0:
+        return {}
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(s[idx:])
+        if isinstance(obj, dict):
+            return obj
+        if isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, dict):
+                    return item
+        return {}
+    except json.JSONDecodeError:
+        return {}
 
 
 def build_listing(payload: Dict[str, Any], key: str, language_name: str) -> LocalizedListing:
@@ -1336,9 +2754,389 @@ def build_listing(payload: Dict[str, Any], key: str, language_name: str) -> Loca
     )
 
 
+def _normalize_listing_parameters_block(params: Any, missing: str) -> Dict[str, str]:
+    raw = params if isinstance(params, dict) else {}
+    out: Dict[str, str] = {}
+    for k in LISTING_PARAMETER_KEYS:
+        v = raw.get(k)
+        s = str(v).strip() if v is not None else ""
+        out[k] = s if s else missing
+    return out
+
+
+def _listing_from_dual_structured_block(
+    block: Dict[str, Any],
+    language_name: str,
+    missing_param: str,
+) -> LocalizedListing:
+    """Build LocalizedListing from dual-image JSON locale block (title, description, category, parameters)."""
+    title = block.get("title", "")
+    description = block.get("description", "")
+    category = block.get("category", "")
+    params_norm = _normalize_listing_parameters_block(block.get("parameters"), missing_param)
+    merged_attrs: Dict[str, str] = {f"param_{k}": v for k, v in params_norm.items()}
+    extra = block.get("key_attributes")
+    if isinstance(extra, dict):
+        for k, v in extra.items():
+            sk = str(k).strip()
+            if sk and sk not in merged_attrs:
+                merged_attrs[sk] = str(v).strip()
+    return LocalizedListing(
+        title=strip_chinese(str(title)) if isinstance(title, str) else "",
+        description=strip_chinese(str(description)) if isinstance(description, str) else "",
+        category=strip_chinese(str(category)) if isinstance(category, str) else "",
+        key_attributes=merged_attrs,
+    )
+
+
+def run_step4_generate_listing_dual_image_bilingual(
+    chat: ChatClient,
+    model: str,
+    source_image: Path,
+    cleaned_image: Optional[Path],
+    structured_attributes: Dict[str, Any],
+    extracted_text: List[str],
+    user_copy_instructions: str,
+    warnings: Optional[List[str]] = None,
+) -> Tuple[LocalizedListing, LocalizedListing]:
+    """One bilingual chat: original + cleaned images, OCR, optional Step3 JSON → strict EN/FR blocks with fixed parameters."""
+    w = warnings if warnings is not None else []
+    if chat.mock:
+        pm_en = {f"param_{k}": STEP4_PARAM_MISSING_EN for k in LISTING_PARAMETER_KEYS}
+        pm_fr = {f"param_{k}": STEP4_PARAM_MISSING_FR for k in LISTING_PARAMETER_KEYS}
+        return (
+            LocalizedListing(
+                title="Mock EN: Dual-image structured listing",
+                description="Mock English description (dual-image path).",
+                category="Mock > Category",
+                key_attributes={**pm_en, "draft_source": "mock_dual_image"},
+            ),
+            LocalizedListing(
+                title="Maquette FR : Liste structurée deux images",
+                description="Maquette description française (chemin deux images).",
+                category="Maquette > Catégorie",
+                key_attributes={**pm_fr, "source_brouillon": "mock_deux_images"},
+            ),
+        )
+
+    attrs_text = json.dumps(structured_attributes, ensure_ascii=False, indent=2)
+    ocr_text = "\n".join(f"- {t}" for t in extracted_text)
+    operator_block = _step4_operator_block(user_copy_instructions)
+    key_lines = ", ".join(f'"{k}"' for k in LISTING_PARAMETER_KEYS)
+    prompt = f"""
+## Your role
+You are a **bilingual ecommerce listing author** for **Canada**. You write **Canadian English** and **Canadian French** in one JSON response.
+
+## Inputs (use all together)
+1. **IMAGE A** (first image after this text): **Original seller listing** — may show Chinese/Latin promo text, watermarks, price hooks. Read product naming and claims here.
+2. **IMAGE B** (second image, if present): **Cleaned product photo** — text overlays removed or repaired; use for true product shape, colour, accessories, and printed specs on the product/box.
+3. **Structured JSON** (hints from an automated vision step; may be wrong — prefer images + OCR if conflict):
+```json
+{attrs_text}
+```
+4. **OCR transcript** (verbatim strings from labeled regions on the **original** listing; includes Chinese):
+{ocr_text}
+
+## Fusion rules
+- Identify the **physical product type** from images + OCR (e.g. Chinese 吹风机 → hair dryer in EN, séchoir à cheveux in FR).
+- Do **not** invent certifications, medical claims, or deals not supported by images/OCR.
+- **Title** and **description** are mandatory and must be substantive.
+- **parameters**: every key listed below **must** appear. If you cannot verify a value from images or OCR, set it **exactly** to:
+  - `Not specified` inside `canadian_english.parameters`
+  - `Non précisé` inside `canadian_french.parameters`
+
+## Parameter keys (exact spelling, all required in each locale block)
+{key_lines}
+
+{operator_block}
+
+## Output format (JSON only — no markdown)
+Return one object with top-level keys **only** `canadian_english` and `canadian_french`. Each value must be an object with:
+- `title` (string, non-empty)
+- `description` (string, non-empty)
+- `category` (string, retail path with ` > ` in that locale)
+- `parameters` (object): exactly the keys above; string values only; use the missing-value rules.
+
+## Language rules
+- `canadian_english` strings: English only (no Chinese characters).
+- `canadian_french` strings: French only (Canadian French; no Chinese characters). Romanize Chinese brand names.
+""".strip()
+
+    user_body = _step4_user_message_content_dual(prompt, source_image, cleaned_image, w)
+    data = chat.chat_json(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You output a single JSON object with keys canadian_english and canadian_french only. "
+                    "Each locale includes title, description, category, and parameters with all required keys. "
+                    "Ground content in the provided images and OCR. No markdown fences."
+                ),
+            },
+            {"role": "user", "content": user_body},
+        ],
+        max_tokens=min(8192, _step4_max_tokens() + 1536),
+        temperature=0.25,
+        response_json_object=False,
+    )
+    data_dict = data if isinstance(data, dict) else {}
+    en_block = _coerce_step4_locale_block(data_dict, "canadian_english")
+    fr_block = _coerce_step4_locale_block(data_dict, "canadian_french")
+    en_listing = _listing_from_dual_structured_block(en_block, "English", STEP4_PARAM_MISSING_EN)
+    fr_listing = _listing_from_dual_structured_block(fr_block, "French", STEP4_PARAM_MISSING_FR)
+    return en_listing, fr_listing
+
+
 def strip_chinese(text: str) -> str:
     """Remove CJK characters to enforce English/French-only user fields."""
     return "".join(ch for ch in text if not ("\u4e00" <= ch <= "\u9fff"))
+
+
+def _structured_field_weak(val: Any) -> bool:
+    s = str(val or "").strip()
+    if not s:
+        return True
+    low = s.lower()
+    if low in ("unknown", "n/a", "none", "unspecified"):
+        return True
+    if low in ("general merchandise", "marchandise générale"):
+        return True
+    return False
+
+
+def enrich_structured_attributes_from_ocr(
+    extracted_text: List[str],
+    structured: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Fill gaps when Step3 vision/chat failed: infer product class, brand, and specs from OCR lines (no LLM)."""
+    out: Dict[str, Any] = {**structured}
+    blob = " ".join(str(x) for x in extracted_text)
+
+    changed = False
+    if _structured_field_weak(out.get("product_type")):
+        if any(k in blob for k in ("吹风机", "电吹风", "風筒", "电风吹")):
+            out["product_type"] = "hair dryer"
+            changed = True
+
+    if _structured_field_weak(out.get("category_hint")):
+        if str(out.get("product_type") or "").strip().lower() == "hair dryer":
+            out["category_hint"] = "Personal care appliances"
+            changed = True
+
+    brand_cur = str(out.get("brand_or_series") or "").strip()
+    if not brand_cur:
+        if "康夫" in blob or "KANGFU" in blob.upper():
+            out["brand_or_series"] = "Kangfu"
+            changed = True
+
+    specs: List[str] = []
+    raw_specs = out.get("size_or_specs")
+    if isinstance(raw_specs, list):
+        specs = [str(x).strip() for x in raw_specs if str(x).strip()]
+    spec_join = " ".join(specs).lower()
+
+    m_w = re.search(r"(\d{3,5})\s*W(?:atts)?", blob, re.I)
+    if m_w:
+        pw = m_w.group(0).strip().replace(" ", "")
+        if "watts" in pw.lower():
+            pw = re.sub(r"watts", "W", pw, flags=re.I)
+        if pw.lower() not in spec_join:
+            specs.append(pw if pw.upper().endswith("W") else f"{pw}W")
+
+    for line in extracted_text:
+        t = str(line).strip()
+        if re.fullmatch(r"\d{4}", t) and t not in spec_join and f"model {t}" not in spec_join:
+            specs.append(f"Model {t}")
+            break
+
+    if "送风嘴" in blob or "风嘴" in blob:
+        mm = re.search(r"(\d+)\s*个", blob)
+        nnoz = mm.group(1) if mm else "2"
+        hint = f"{nnoz} styling nozzles included"
+        if hint.lower() not in spec_join:
+            specs.append(hint)
+
+    out["size_or_specs"] = specs
+
+    if str(out.get("confidence") or "").lower() == "low" and changed:
+        out["confidence"] = "medium_ocr_fallback"
+
+    return out
+
+
+def _listing_param_placeholders(target: Literal["canadian_english", "canadian_french"]) -> Dict[str, str]:
+    miss = STEP4_PARAM_MISSING_EN if target == "canadian_english" else STEP4_PARAM_MISSING_FR
+    return {f"param_{k}": miss for k in LISTING_PARAMETER_KEYS}
+
+
+# Minimal EN→FR labels for heuristic listing titles/params when vision API is down.
+_HEURISTIC_PRODUCT_TYPE_EN_TO_FR: Dict[str, str] = {
+    "hair dryer": "Sèche-cheveux",
+}
+_HEURISTIC_CATEGORY_EN_TO_FR: Dict[str, str] = {
+    "personal care appliances": "Électroménager de soins personnels",
+    "general merchandise": "Marchandise générale",
+}
+
+
+def _heuristic_listing_param_fills(
+    structured: Dict[str, Any],
+    extracted: List[str],
+    target: Literal["canadian_english", "canadian_french"],
+) -> Dict[str, str]:
+    """Fill param_* from enriched structured + OCR when models did not return JSON."""
+    blob = " ".join(str(x) for x in extracted)
+    is_fr = target == "canadian_french"
+    fills: Dict[str, str] = {}
+
+    brand = str(structured.get("brand_or_series") or "").strip()
+    if brand:
+        fills["param_brand"] = brand
+
+    pt = str(structured.get("product_type") or "").strip()
+    if pt and not _structured_field_weak(pt):
+        fills["param_product_type"] = (
+            _HEURISTIC_PRODUCT_TYPE_EN_TO_FR.get(pt.lower(), pt) if is_fr else pt
+        )
+
+    for line in extracted:
+        t = str(line).strip()
+        if re.fullmatch(r"\d{4}", t):
+            fills["param_model"] = t
+            break
+
+    m_w = re.search(r"(\d{3,5})\s*W(?:atts)?", blob, re.I)
+    if m_w:
+        raw = m_w.group(0).strip().replace(" ", "")
+        if not re.search(r"W", raw, re.I):
+            raw = f"{raw}W"
+        fills["param_power"] = raw
+
+    if "送风嘴" in blob or "风嘴" in blob:
+        mm = re.search(r"(\d+)\s*个", blob)
+        nnoz = mm.group(1) if mm else "2"
+        fills["param_included_accessories"] = (
+            f"{nnoz} buses de concentration" if is_fr else f"{nnoz} styling nozzles"
+        )
+
+    if "CCC" in blob.upper() or re.search(r"\b3C\b", blob):
+        fills["param_certifications_visible"] = (
+            "Certification CCC visible sur le produit"
+            if is_fr
+            else "CCC certification visible on product"
+        )
+
+    return {k: v for k, v in fills.items() if v}
+
+
+def build_step4_heuristic_listing(
+    structured: Dict[str, Any],
+    extracted: List[str],
+    target: Literal["canadian_english", "canadian_french"],
+) -> LocalizedListing:
+    """Deterministic draft from Step3 + OCR when copy models return nothing usable (always non-empty body)."""
+    ptype_raw = str(structured.get("product_type") or "").strip()
+    cat_raw = str(structured.get("category_hint") or "").strip()
+    if target == "canadian_french":
+        ptype = _HEURISTIC_PRODUCT_TYPE_EN_TO_FR.get(ptype_raw.lower(), strip_chinese(ptype_raw)) or (
+            strip_chinese(ptype_raw) or "Produit"
+        )
+        cat = _HEURISTIC_CATEGORY_EN_TO_FR.get(cat_raw.lower(), strip_chinese(cat_raw)) or (
+            strip_chinese(cat_raw) or "Marchandise générale"
+        )
+    else:
+        ptype = strip_chinese(ptype_raw) or "Product"
+        cat = strip_chinese(cat_raw) or "General Merchandise"
+    material = strip_chinese(str(structured.get("material") or "").strip())
+    brand = strip_chinese(str(structured.get("brand_or_series") or "").strip())
+    feats = structured.get("key_features")
+    if not isinstance(feats, list):
+        feats = []
+    feat_lines = [strip_chinese(str(x).strip()) for x in feats[:10]]
+    feat_lines = [x for x in feat_lines if x]
+    specs = structured.get("size_or_specs")
+    if not isinstance(specs, list):
+        specs = []
+    spec_lines = [strip_chinese(str(x).strip()) for x in specs[:8]]
+    spec_lines = [x for x in spec_lines if x]
+    ocr_lines: List[str] = []
+    for line in extracted[:15]:
+        s = strip_chinese(str(line).strip())
+        if len(s) > 1:
+            ocr_lines.append(s[:240])
+    conf = strip_chinese(str(structured.get("confidence") or "").strip())
+
+    if target == "canadian_english":
+        title = f"{ptype} — {cat}"[:220]
+        parts: List[str] = [
+            "Draft listing assembled from vision + OCR because the copy models did not return usable JSON.",
+            "Review and replace with verified marketing copy before publishing.",
+            "",
+            f"**Product type:** {ptype}",
+            f"**Category:** {cat}",
+        ]
+        if brand:
+            parts.append(f"**Brand / series:** {brand}")
+        if material:
+            parts.append(f"**Material:** {material}")
+        if feat_lines:
+            parts.extend(["", "**Highlights:**", *[f"- {x}" for x in feat_lines]])
+        if spec_lines:
+            parts.extend(["", "**Size / specs:**", *[f"- {x}" for x in spec_lines]])
+        if ocr_lines:
+            parts.extend(["", "**On-image text (Latin / numbers only, Chinese stripped):**", *[f"- {x}" for x in ocr_lines]])
+        if conf:
+            parts.append(f"\n*(Vision confidence: {conf})*")
+        base_attrs = _listing_param_placeholders("canadian_english")
+        for pk, pv in _heuristic_listing_param_fills(structured, extracted, "canadian_english").items():
+            base_attrs[pk] = pv
+        base_attrs["draft_source"] = "heuristic_en"
+        base_attrs["needs_human_review"] = "true"
+        return LocalizedListing(
+            title=title,
+            description="\n".join(parts),
+            category=cat[:200],
+            key_attributes=base_attrs,
+        )
+
+    title_fr = f"{ptype} — {cat}"[:220]
+    parts_fr: List[str] = [
+        "Ébauche construite à partir de la vision et de l'OCR : les modèles n'ont pas renvoyé de JSON exploitable.",
+        "À réviser avant publication.",
+        "",
+        f"**Type de produit :** {ptype}",
+        f"**Catégorie :** {cat}",
+    ]
+    if brand:
+        parts_fr.append(f"**Marque / série :** {brand}")
+    if material:
+        parts_fr.append(f"**Matériau :** {material}")
+    if feat_lines:
+        parts_fr.extend(["", "**Points saillants :**", *[f"- {x}" for x in feat_lines]])
+    if spec_lines:
+        parts_fr.extend(["", "**Taille / specs :**", *[f"- {x}" for x in spec_lines]])
+    if ocr_lines:
+        parts_fr.extend(
+            [
+                "",
+                "**Texte sur l'image (latin/chiffres seulement, chinois retiré) :**",
+                *[f"- {x}" for x in ocr_lines],
+            ]
+        )
+    if conf:
+        parts_fr.append(f"\n*(Confiance vision : {conf})*")
+    base_fr = _listing_param_placeholders("canadian_french")
+    for pk, pv in _heuristic_listing_param_fills(structured, extracted, "canadian_french").items():
+        base_fr[pk] = pv
+    base_fr["source_brouillon"] = "heuristique_fr"
+    base_fr["revision_requise"] = "true"
+    return LocalizedListing(
+        title=title_fr,
+        description="\n".join(parts_fr),
+        category=cat[:200],
+        key_attributes=base_fr,
+    )
 
 
 def path_to_data_url(path: Path, force_png: bool = False) -> str:
@@ -1352,19 +3150,392 @@ def path_to_data_url(path: Path, force_png: bool = False) -> str:
     return f"data:{mime};base64,{b64}"
 
 
+def _rq_outcome_debug_enabled() -> bool:
+    return (os.getenv("GMI_RQ_OUTCOME_DEBUG") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _rq_outcome_debug_deep_enabled() -> bool:
+    return (os.getenv("GMI_RQ_OUTCOME_DEBUG_DEEP") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _rq_outcome_debug_deep_tree(outcome: Dict[str, Any], max_depth: int = 3) -> str:
+    """Multi-line nested key / shape summary (no full base64). max_depth caps recursion."""
+
+    def walk(obj: Any, depth: int, indent: str) -> List[str]:
+        if depth > max_depth:
+            return [f"{indent}…"]
+        lines: List[str] = []
+        if isinstance(obj, dict):
+            keys = sorted(obj.keys())
+            for k in keys[:48]:
+                v = obj[k]
+                if isinstance(v, dict):
+                    lines.append(f"{indent}{k}: dict(n_keys={len(v)})")
+                    lines.extend(walk(v, depth + 1, indent + "  "))
+                elif isinstance(v, list):
+                    lines.append(f"{indent}{k}: list(n={len(v)})")
+                    if v:
+                        el0 = v[0]
+                        if isinstance(el0, dict):
+                            lines.append(f"{indent}  [0]: dict(n_keys={len(el0)})")
+                            lines.extend(walk(el0, depth + 1, indent + "    "))
+                        elif isinstance(el0, str):
+                            lines.append(f"{indent}  [0]: str(len={len(el0)},head={el0[:40]!r}…)")
+                        else:
+                            lines.append(f"{indent}  [0]: {type(el0).__name__}")
+                elif isinstance(v, str):
+                    lines.append(f"{indent}{k}: str(len={len(v)},head={v[:48]!r}…)")
+                elif isinstance(v, (bytes, bytearray)):
+                    lines.append(f"{indent}{k}: bytes(n={len(v)})")
+                else:
+                    lines.append(f"{indent}{k}: {type(v).__name__}")
+            if len(keys) > 48:
+                lines.append(f"{indent}…({len(keys) - 48} more keys)")
+        elif isinstance(obj, list) and obj:
+            lines.extend(walk(obj[0], depth, indent + "[0] "))
+        return lines
+
+    return "\n".join(walk(outcome, 0, ""))
+
+
+def _rq_outcome_debug_summary(outcome: Any, max_keys: int = 36) -> str:
+    if outcome is None:
+        return "outcome=None"
+    if not isinstance(outcome, dict):
+        return f"type={type(outcome).__name__} repr={repr(outcome)[:400]}"
+    parts: List[str] = []
+    for i, (k, v) in enumerate(sorted(outcome.keys())):
+        if i >= max_keys:
+            parts.append("…")
+            break
+        if isinstance(v, dict):
+            parts.append(f"{k}=dict(keys={list(v.keys())[:10]})")
+        elif isinstance(v, list):
+            el = type(v[0]).__name__ if v else "empty"
+            parts.append(f"{k}=list(n={len(v)},{el})")
+        elif isinstance(v, str):
+            parts.append(f"{k}=str(n={len(v)},head={v[:72]!r})")
+        elif isinstance(v, (bytes, bytearray)):
+            parts.append(f"{k}=bytes(n={len(v)})")
+        else:
+            parts.append(f"{k}={type(v).__name__}")
+    return "; ".join(parts) if parts else "{}"
+
+
+def _log_rq_outcome_debug(component: str, outcome: Any) -> None:
+    if _rq_outcome_debug_enabled():
+        print(f"GMI RQ outcome debug [{component}]: {_rq_outcome_debug_summary(outcome)}", file=sys.stderr)
+    if _rq_outcome_debug_deep_enabled() and isinstance(outcome, dict):
+        print(f"GMI RQ outcome debug-deep [{component}]:\n{_rq_outcome_debug_deep_tree(outcome)}", file=sys.stderr)
+
+
 def extract_media_url(outcome: Dict[str, Any]) -> Optional[str]:
     media_urls = outcome.get("media_urls")
     if isinstance(media_urls, list) and media_urls:
         first = media_urls[0]
-        if isinstance(first, dict) and isinstance(first.get("url"), str):
-            return first["url"]
-        if isinstance(first, str):
+        if isinstance(first, dict):
+            for kk in ("url", "uri", "href", "signed_url", "output_url", "image_url"):
+                u = first.get(kk)
+                if isinstance(u, str) and u.startswith("http"):
+                    return u
+        elif isinstance(first, str) and first.startswith("http"):
             return first
-    for key in ["image_url", "preview_image_url", "thumbnail_image_url", "url"]:
+    for key in (
+        "image_url",
+        "preview_image_url",
+        "thumbnail_image_url",
+        "url",
+        "output_url",
+        "result_url",
+        "uri",
+        "href",
+        "signed_url",
+    ):
         val = outcome.get(key)
         if isinstance(val, str) and val.startswith("http"):
             return val
     return None
+
+
+def _decode_inline_image_string(s: str) -> Optional[bytes]:
+    """Decode data-URL or raw base64 image string from RQ outcome (Gemini / some gateways)."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    if s.startswith("data:") and "base64," in s:
+        try:
+            raw = base64.b64decode(s.split("base64,", 1)[1].strip())
+            return raw if raw else None
+        except Exception:
+            return None
+    if len(s) > 80:
+        try:
+            raw = base64.b64decode(s, validate=False)
+            if len(raw) > 200 and (raw[:4] == b"\x89PNG" or raw[:2] == b"\xff\xd8" or raw[:4] == b"RIFF"):
+                return raw
+        except Exception:
+            pass
+    return None
+
+
+def extract_media_bytes_from_outcome(outcome: Any, _depth: int = 0) -> Optional[bytes]:
+    """HTTP URL fetch first (via extract_media_url); then nested dict / list / base64 fields.
+
+    Some gateways put images in ``images`` / ``outputs`` lists or use ``uri`` instead of ``url``.
+    Recursion is depth-capped to avoid cycles.
+    """
+    if _depth > 8 or not isinstance(outcome, dict):
+        return None
+    for top_str_key in ("data", "content"):
+        tv = outcome.get(top_str_key)
+        if isinstance(tv, str):
+            got = _decode_inline_image_string(tv)
+            if got:
+                return got
+    for dk in ("url", "image_url", "output_url", "result_url", "preview_image_url", "uri", "href"):
+        v = outcome.get(dk)
+        if isinstance(v, str) and v.startswith("data:"):
+            got = _decode_inline_image_string(v)
+            if got:
+                return got
+    url = extract_media_url(outcome)
+    if url:
+        try:
+            r = requests.get(url, timeout=120)
+            r.raise_for_status()
+            return r.content
+        except Exception:
+            pass
+    for key in (
+        "image",
+        "output_image",
+        "result_image",
+        "image_base64",
+        "b64_json",
+        "base64_image",
+        "base64",
+        "b64",
+        "output_b64",
+        "bytes",
+    ):
+        v = outcome.get(key)
+        if isinstance(v, str):
+            got = _decode_inline_image_string(v)
+            if got:
+                return got
+        elif isinstance(v, (bytes, bytearray)) and len(v) > 200:
+            return bytes(v)
+    for key in (
+        "images",
+        "image_list",
+        "output_images",
+        "generated_images",
+        "results",
+        "outputs",
+        "artifacts",
+        "candidates",
+        "files",
+        "media",
+        "items",
+    ):
+        v = outcome.get(key)
+        if not isinstance(v, list):
+            continue
+        for item in v:
+            if isinstance(item, str):
+                if item.startswith("http"):
+                    try:
+                        r = requests.get(item, timeout=120)
+                        r.raise_for_status()
+                        return r.content
+                    except Exception:
+                        continue
+                got = _decode_inline_image_string(item)
+                if got:
+                    return got
+            elif isinstance(item, dict):
+                got = extract_media_bytes_from_outcome(item, _depth + 1)
+                if got:
+                    return got
+            elif isinstance(item, (bytes, bytearray)) and len(item) > 200:
+                return bytes(item)
+    for wrap in ("result", "data", "output", "response", "outcome", "image_result"):
+        inner = outcome.get(wrap)
+        if isinstance(inner, dict):
+            got = extract_media_bytes_from_outcome(inner, _depth + 1)
+            if got:
+                return got
+        elif isinstance(inner, list):
+            got = extract_media_bytes_from_outcome({"images": inner}, _depth + 1)
+            if got:
+                return got
+        elif isinstance(inner, str):
+            got = _decode_inline_image_string(inner)
+            if got:
+                return got
+    return None
+
+
+def extract_all_media_bytes_from_outcome(
+    outcome: Any,
+    *,
+    max_n: Optional[int] = None,
+    _depth: int = 0,
+) -> List[bytes]:
+    """Collect up to ``max_n`` distinct image byte blobs from an RQ outcome (multi-image / nested).
+
+    Used when ``media_urls`` is populated but the first-pass decode in ``run_image_variants`` missed paths
+    (e.g. nested ``data.url``, extra list keys). De-duplicates by SHA-256 of raw bytes.
+    """
+    if _depth > 8 or not isinstance(outcome, dict):
+        return []
+    collected: List[bytes] = []
+    seen_hash: set[str] = set()
+
+    def _push(raw: Optional[bytes]) -> None:
+        if not raw or len(raw) < 200:
+            return
+        if max_n is not None and len(collected) >= max_n:
+            return
+        h = hashlib.sha256(raw).hexdigest()
+        if h in seen_hash:
+            return
+        seen_hash.add(h)
+        collected.append(raw)
+
+    for top_sk in ("data", "content"):
+        tv = outcome.get(top_sk)
+        if isinstance(tv, str):
+            _push(_decode_inline_image_string(tv))
+
+    media_urls = outcome.get("media_urls")
+    if isinstance(media_urls, list):
+        for item in media_urls:
+            if max_n is not None and len(collected) >= max_n:
+                break
+            if isinstance(item, dict):
+                u = None
+                for kk in ("url", "uri", "href", "signed_url", "output_url", "image_url"):
+                    x = item.get(kk)
+                    if isinstance(x, str) and x.startswith("http"):
+                        u = x
+                        break
+                if u:
+                    try:
+                        r = requests.get(u, timeout=120)
+                        r.raise_for_status()
+                        _push(r.content)
+                    except Exception:
+                        pass
+                nested = item.get("data")
+                if isinstance(nested, dict):
+                    for kk in ("url", "uri", "signed_url", "output_url", "image_url"):
+                        x = nested.get(kk)
+                        if isinstance(x, str) and x.startswith("http"):
+                            try:
+                                r = requests.get(x, timeout=120)
+                                r.raise_for_status()
+                                _push(r.content)
+                            except Exception:
+                                pass
+                elif isinstance(nested, str):
+                    _push(_decode_inline_image_string(nested))
+                for k in ("image", "image_base64", "base64", "data", "b64_json"):
+                    v = item.get(k)
+                    if isinstance(v, str):
+                        dec = _decode_inline_image_string(v)
+                        if dec:
+                            _push(dec)
+                got_item = extract_media_bytes_from_outcome(item, _depth=_depth + 1)
+                if got_item:
+                    _push(got_item)
+            elif isinstance(item, str):
+                if item.startswith("http"):
+                    try:
+                        r = requests.get(item, timeout=120)
+                        r.raise_for_status()
+                        _push(r.content)
+                    except Exception:
+                        pass
+                else:
+                    dec = _decode_inline_image_string(item)
+                    if dec:
+                        _push(dec)
+
+    for key in (
+        "images",
+        "image_list",
+        "output_images",
+        "generated_images",
+        "results",
+        "outputs",
+        "artifacts",
+        "candidates",
+        "files",
+        "media",
+        "items",
+    ):
+        v = outcome.get(key)
+        if not isinstance(v, list):
+            continue
+        for item in v:
+            if max_n is not None and len(collected) >= max_n:
+                break
+            if isinstance(item, dict):
+                got = extract_media_bytes_from_outcome(item, _depth=_depth + 1)
+                if got:
+                    _push(got)
+            elif isinstance(item, str):
+                if item.startswith("http"):
+                    try:
+                        r = requests.get(item, timeout=120)
+                        r.raise_for_status()
+                        _push(r.content)
+                    except Exception:
+                        pass
+                else:
+                    dec = _decode_inline_image_string(item)
+                    if dec:
+                        _push(dec)
+
+    for kk in ("image_url", "output_url", "result_url", "preview_image_url", "url", "uri", "href", "signed_url"):
+        u = outcome.get(kk)
+        if isinstance(u, str) and u.startswith("http"):
+            try:
+                r = requests.get(u, timeout=120)
+                r.raise_for_status()
+                _push(r.content)
+            except Exception:
+                pass
+
+    for k in ("image_base64", "b64_json", "base64_image", "base64", "b64", "output_b64"):
+        v = outcome.get(k)
+        if isinstance(v, str):
+            dec = _decode_inline_image_string(v)
+            if dec:
+                _push(dec)
+
+    if max_n is None or len(collected) < max_n:
+        for wrap in ("result", "data", "output", "response", "outcome", "image_result"):
+            inner = outcome.get(wrap)
+            if isinstance(inner, dict):
+                for b in extract_all_media_bytes_from_outcome(inner, max_n=max_n, _depth=_depth + 1):
+                    _push(b)
+                    if max_n is not None and len(collected) >= max_n:
+                        break
+            elif isinstance(inner, list):
+                for b in extract_all_media_bytes_from_outcome({"images": inner}, max_n=max_n, _depth=_depth + 1):
+                    _push(b)
+                    if max_n is not None and len(collected) >= max_n:
+                        break
+            elif isinstance(inner, str):
+                _push(_decode_inline_image_string(inner))
+                if max_n is not None and len(collected) >= max_n:
+                    break
+
+    if max_n is None:
+        return collected
+    return collected[:max_n]
 
 
 def write_output(artifacts: Sequence[EcommerceArtifact], output_path: Path) -> Path:
@@ -1374,10 +3545,12 @@ def write_output(artifacts: Sequence[EcommerceArtifact], output_path: Path) -> P
         try:
             import yaml  # type: ignore
 
+            if not hasattr(yaml, "safe_dump"):
+                raise ImportError("PyYAML provides yaml.safe_dump; check for a shadowing yaml.py / wrong package.")
             with output_path.open("w", encoding="utf-8") as fp:
                 yaml.safe_dump([asdict(a) for a in artifacts], fp, allow_unicode=True, sort_keys=False)
             return output_path
-        except ImportError:
+        except (ImportError, AttributeError):
             output_path = output_path.with_suffix(".json")
             suffix = ".json"
     if suffix == ".json":
@@ -1417,6 +3590,7 @@ def _build_stability_snapshot(
         "locale_grammar_revise": int(stats.get("locale_grammar_revise", 0)),
         "overlay_classifier_failed": int(stats.get("overlay_classifier_failed", 0)),
         "annotation_missing": int(stats.get("annotation_missing", 0)),
+        "annotation_audit_fallback_used": int(stats.get("annotation_audit_fallback_used", 0)),
         "total_warning_events": int(stats.get("total_warning_events", 0)),
         "avg_warning_events_per_item": round(
             (stats.get("total_warning_events", 0) / processed) if processed else 0.0,
@@ -1453,6 +3627,7 @@ def _write_stability_reports(snapshot: Dict[str, Any], json_path: Optional[Path]
             f"- Locale grammar revise (EN or FR): `{snapshot['locale_grammar_revise']}`",
             f"- Overlay classifier failed: `{snapshot['overlay_classifier_failed']}`",
             f"- Annotation missing: `{snapshot['annotation_missing']}`",
+            f"- Annotation audit fallback (mask_mode): `{snapshot['annotation_audit_fallback_used']}`",
             f"- Avg warning events per item: `{snapshot['avg_warning_events_per_item']}`",
             f"- Estimated clean item ratio: `{snapshot['estimated_clean_item_ratio']:.2%}`",
         ]
@@ -1464,6 +3639,38 @@ def _safe_slug(text: str) -> str:
     while "__" in out:
         out = out.replace("__", "_")
     return out.strip("_") or "item"
+
+
+def _listing_param_label(param_key: str) -> str:
+    """param_brand -> Brand; param_product_type -> Product Type"""
+    base = param_key[6:] if param_key.startswith("param_") else param_key
+    return base.replace("_", " ").strip().title()
+
+
+def _partition_listing_key_attributes(attrs: Dict[str, str]) -> Tuple[Dict[str, str], Dict[str, str]]:
+    param: Dict[str, str] = {}
+    other: Dict[str, str] = {}
+    for k, v in attrs.items():
+        sk = str(k)
+        if sk.startswith("param_"):
+            param[sk] = str(v)
+        else:
+            other[sk] = str(v)
+    return param, other
+
+
+def _format_parameters_markdown_section(param_attrs: Dict[str, str], title: str) -> List[str]:
+    lines = [title, ""]
+    ordered_keys = [f"param_{k}" for k in LISTING_PARAMETER_KEYS]
+    for pk in ordered_keys:
+        if pk in param_attrs:
+            lines.append(f"- **{_listing_param_label(pk)}**: {param_attrs[pk]}")
+    for pk in sorted(k for k in param_attrs if k not in ordered_keys):
+        lines.append(f"- **{_listing_param_label(pk)}**: {param_attrs[pk]}")
+    if len(lines) == 2:
+        lines.append("- _(none)_")
+    lines.append("")
+    return lines
 
 
 def export_deliverables(artifacts: Sequence[EcommerceArtifact], deliverable_dir: Path) -> Path:
@@ -1491,6 +3698,10 @@ def export_deliverables(artifacts: Sequence[EcommerceArtifact], deliverable_dir:
         fr_path = product_dir / "description_fr.md"
         manifest_path = product_dir / "manifest.json"
 
+        en_param, en_other = _partition_listing_key_attributes(dict(artifact.canadian_english.key_attributes))
+        fr_param, fr_other = _partition_listing_key_attributes(dict(artifact.canadian_french.key_attributes))
+        en_other_lines = [f"- {k}: {v}" for k, v in sorted(en_other.items())] or ["- _(none)_"]
+        fr_other_lines = [f"- {k}: {v}" for k, v in sorted(fr_other.items())] or ["- _(aucun)_"]
         en_text = "\n".join(
             [
                 f"# {artifact.canadian_english.title}",
@@ -1499,8 +3710,9 @@ def export_deliverables(artifacts: Sequence[EcommerceArtifact], deliverable_dir:
                 "",
                 artifact.canadian_english.description,
                 "",
-                "## Key Attributes",
-                *[f"- {k}: {v}" for k, v in artifact.canadian_english.key_attributes.items()],
+                *_format_parameters_markdown_section(en_param, "## Parameters"),
+                "## Other attributes",
+                *en_other_lines,
             ]
         )
         fr_text = "\n".join(
@@ -1511,8 +3723,9 @@ def export_deliverables(artifacts: Sequence[EcommerceArtifact], deliverable_dir:
                 "",
                 artifact.canadian_french.description,
                 "",
-                "## Attributs clés",
-                *[f"- {k}: {v}" for k, v in artifact.canadian_french.key_attributes.items()],
+                *_format_parameters_markdown_section(fr_param, "## Paramètres"),
+                "## Autres attributs",
+                *fr_other_lines,
             ]
         )
 
@@ -1625,6 +3838,8 @@ def run_pipeline(args: argparse.Namespace) -> Path:
 
     rq = RequestQueueClient(api_key=api_key or "mock", mock=args.mock, max_attempts=args.max_attempts)
     chat = ChatClient(api_key=api_key or "mock", mock=args.mock, max_attempts=args.max_attempts)
+    # Executor for per-SKU parallelism (e.g., listing vs extra images after Step3).
+    executor = ThreadPoolExecutor(max_workers=max(2, int(os.getenv("GMI_PARALLEL_WORKERS_PER_SKU", "2"))))
     input_items = collect_input_items(args)
     run_started_at = _utc_now_iso()
     stability_stats: Dict[str, Any] = {
@@ -1644,6 +3859,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         "step4c_locale_grammar_failed": 0,
         "locale_grammar_fail": 0,
         "locale_grammar_revise": 0,
+        "annotation_audit_fallback_used": 0,
     }
     stability_json_path = Path(args.stability_report_path) if args.stability_report_path else None
     stability_md_path = Path(args.stability_markdown_path) if args.stability_markdown_path else None
@@ -1651,6 +3867,14 @@ def run_pipeline(args: argparse.Namespace) -> Path:
 
     work_img_dir = Path(args.image_output_dir)
     work_img_dir.mkdir(parents=True, exist_ok=True)
+
+    pp_file = getattr(args, "pipeline_progress_file", None)
+    pipeline_progress_init(Path(pp_file).expanduser().resolve() if pp_file else None)
+    pipeline_progress_emit(
+        "pipeline",
+        "run_start",
+        detail=f"items={len(input_items)} mock={bool(args.mock)} out={args.output}",
+    )
 
     instr_warnings: List[str] = []
     user_copy_resolved = resolve_operator_instructions(
@@ -1682,6 +3906,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
 
     artifacts: List[EcommerceArtifact] = []
     for product_id, source_image, ann in input_items:
+        pipeline_progress_emit("sku", "item_start", product_id=product_id, detail=source_image.name)
         warnings: List[str] = []
         spans = parse_annotation_file(ann) if ann is not None else []
         extracted_raw = [s.text for s in spans if s.text]
@@ -1696,37 +3921,64 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         erased_span_indices: Optional[List[int]] = None
         spans_for_mask = spans
         if not args.disable_erase and (not args.no_mask) and args.mask_mode in {"overlay", "all"}:
-            erased_span_indices = select_spans_to_erase(
-                chat=chat,
-                vision_model=args.vision_model,
-                source_image=source_image,
-                spans=spans,
-                warnings=warnings,
-                mode=args.mask_mode,
-            )
+            audit_model = (getattr(args, "annotation_audit_model", "") or "").strip() or args.vision_model
+            if getattr(args, "annotation_audit", True) and not chat.mock and spans:
+                with pipeline_progress_span("annotation_audit", model=audit_model, product_id=product_id):
+                    audited = audit_mtwi_annotation_spans(
+                        chat=chat,
+                        model=audit_model,
+                        source_image=source_image,
+                        spans=spans,
+                        warnings=warnings,
+                    )
+                if audited is not None:
+                    erased_span_indices = audited
+                    if not audited and spans:
+                        warnings.append(
+                            "annotation_audit_empty_mask: VLM selected no inpaint targets; "
+                            "fix txt/quads or pass --no-annotation-audit to use --mask-mode only"
+                        )
+                else:
+                    stability_stats["annotation_audit_fallback_used"] += 1
+            if erased_span_indices is None:
+                erased_span_indices = select_spans_to_erase(
+                    chat=chat,
+                    vision_model=args.vision_model,
+                    source_image=source_image,
+                    spans=spans,
+                    warnings=warnings,
+                    mode=args.mask_mode,
+                )
             spans_for_mask = [spans[i] for i in erased_span_indices] if erased_span_indices is not None else spans
 
         if not args.disable_erase:
+            s1_model = "local_opencv" if args.erase_strategy == "local" else str(args.eraser_model)
             try:
-                if args.erase_strategy == "local":
-                    erased_path = run_step1_text_erase_local(
-                        source_image=source_image,
-                        spans=spans_for_mask,
-                        product_id=product_id,
-                        out_dir=work_img_dir,
-                        use_mask=not bool(args.no_mask),
-                    )
-                else:
-                    erased_path = run_step1_text_erase(
-                        rq=rq,
-                        source_image=source_image,
-                        spans=spans_for_mask,
-                        product_id=product_id,
-                        out_dir=work_img_dir,
-                        eraser_model=args.eraser_model,
-                        use_mask=not bool(args.no_mask),
-                        user_image_instructions=user_image_resolved,
-                    )
+                with pipeline_progress_span(
+                    "step1_erase",
+                    model=s1_model,
+                    product_id=product_id,
+                    detail=args.erase_strategy,
+                ):
+                    if args.erase_strategy == "local":
+                        erased_path = run_step1_text_erase_local(
+                            source_image=source_image,
+                            spans=spans_for_mask,
+                            product_id=product_id,
+                            out_dir=work_img_dir,
+                            use_mask=not bool(args.no_mask),
+                        )
+                    else:
+                        erased_path = run_step1_text_erase(
+                            rq=rq,
+                            source_image=source_image,
+                            spans=spans_for_mask,
+                            product_id=product_id,
+                            out_dir=work_img_dir,
+                            eraser_model=args.eraser_model,
+                            use_mask=not bool(args.no_mask),
+                            user_image_instructions=user_image_resolved,
+                        )
             except Exception as exc:
                 warnings.append(f"step1_erase_failed: {exc}")
                 stability_stats["step1_erase_failed"] += 1
@@ -1736,14 +3988,19 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         # Optional naturalization pass to fix local erase artifacts.
         if args.harmonize_after_erase:
             try:
-                harmonized = run_step2_harmonize_model(
-                    rq=rq,
-                    erased_image=erased_path,
+                with pipeline_progress_span(
+                    "step2_harmonize",
+                    model=str(args.harmonize_model),
                     product_id=product_id,
-                    out_dir=work_img_dir,
-                    harmonize_model=args.harmonize_model,
-                    user_image_instructions=user_image_resolved,
-                )
+                ):
+                    harmonized = run_step2_harmonize_model(
+                        rq=rq,
+                        erased_image=erased_path,
+                        product_id=product_id,
+                        out_dir=work_img_dir,
+                        harmonize_model=args.harmonize_model,
+                        user_image_instructions=user_image_resolved,
+                    )
                 if harmonized is not None:
                     erased_path = harmonized
             except Exception as exc:
@@ -1751,35 +4008,116 @@ def run_pipeline(args: argparse.Namespace) -> Path:
 
         if not args.disable_restore:
             try:
-                if args.quality_strategy == "local":
-                    final_path = run_step2_enhance_local(
-                        erased_image=erased_path,
-                        product_id=product_id,
-                        out_dir=work_img_dir,
-                    )
-                else:
-                    final_path = run_step2_restore(
-                        rq=rq,
-                        erased_image=erased_path,
-                        product_id=product_id,
-                        out_dir=work_img_dir,
-                        restore_model=args.restore_model,
-                        user_image_instructions=user_image_resolved,
-                    )
+                with pipeline_progress_span(
+                    "step2_restore",
+                    model="local_pil" if args.quality_strategy == "local" else str(args.restore_model),
+                    product_id=product_id,
+                    detail=args.quality_strategy,
+                ):
+                    if args.quality_strategy == "local":
+                        final_path = run_step2_enhance_local(
+                            erased_image=erased_path,
+                            product_id=product_id,
+                            out_dir=work_img_dir,
+                        )
+                    else:
+                        final_path = run_step2_restore(
+                            rq=rq,
+                            erased_image=erased_path,
+                            product_id=product_id,
+                            out_dir=work_img_dir,
+                            restore_model=args.restore_model,
+                            user_image_instructions=user_image_resolved,
+                        )
             except Exception as exc:
                 warnings.append(f"step2_restore_failed: {exc}")
                 stability_stats["step2_restore_failed"] += 1
         if not final_path:
             final_path = erased_path
 
+        listing_mode = getattr(args, "copy_understand_image", "final")
+        pre_additional_paths: List[str] = []
+        listing_ref_audit: Optional[Dict[str, Any]] = None
+        step3_img: Path = final_path or erased_path or source_image
+        image_context = "clean_main"
+
+        if listing_mode == "source":
+            step3_img = source_image
+            image_context = "original_raw"
+        elif listing_mode == "extra1":
+            if not args.generate_additional_images or int(getattr(args, "additional_image_count", 0) or 0) < 1:
+                warnings.append(
+                    "copy_understand_extra1_unavailable: need generate-additional-images and count>=1; using final for step3"
+                )
+            elif not final_path:
+                warnings.append("copy_understand_extra1_unavailable: no final_path; using source for step3")
+                step3_img = source_image
+                image_context = "original_raw"
+            else:
+                mini_struct: Dict[str, Any] = {"product_type": "", "key_features": extracted[:6] if extracted else []}
+                early: List[str] = []
+                try:
+                    with pipeline_progress_span(
+                        "extra1_pregen",
+                        model=str(args.additional_image_model),
+                        product_id=product_id,
+                        detail="copy_understand_image=extra1",
+                    ):
+                        early = generate_additional_product_images(
+                            rq=rq,
+                            source_for_generation=final_path,
+                            product_id=product_id,
+                            out_dir=work_img_dir,
+                            model=args.additional_image_model,
+                            count=1,
+                            structured_attributes=mini_struct,
+                            user_image_instructions=user_image_resolved,
+                            scenario_offset=0,
+                            first_file_index=1,
+                            warnings=warnings,
+                            fallback_model=getattr(args, "fallback_additional_image_model", None) or None,
+                        )
+                except Exception as exc:
+                    warnings.append(f"listing_extra1_pregen_failed: {exc}")
+                if early:
+                    ex_path = Path(early[0])
+                    pre_additional_paths = [str(ex_path)]
+                    with pipeline_progress_span(
+                        "listing_reference_audit",
+                        model=str(args.vision_model),
+                        product_id=product_id,
+                    ):
+                        listing_ref_audit = run_listing_reference_consistency_audit(
+                            chat=chat,
+                            model=args.vision_model,
+                            original_listing_image=source_image,
+                            marketing_variant_image=ex_path,
+                            warnings=warnings,
+                        )
+                    if listing_ref_audit.get("safe_to_use_variant_for_copy"):
+                        step3_img = ex_path
+                        image_context = "marketing_variant"
+                    else:
+                        dn = (listing_ref_audit.get("drift_notes") or "")[:220]
+                        warnings.append(f"listing_reference_audit_reject_extra1: {dn}")
+                else:
+                    warnings.append("listing_extra1_pregen_empty: using final for step3")
+
         try:
-            structured = run_step3_understand_product(
-                chat=chat,
-                model=args.vision_model,
+            with pipeline_progress_span(
+                "step3_vision",
+                model=str(args.vision_model),
                 product_id=product_id,
-                source_image=source_image,
-                extracted_text=extracted,
-            )
+                detail=image_context,
+            ):
+                structured = run_step3_understand_product(
+                    chat=chat,
+                    model=args.vision_model,
+                    product_id=product_id,
+                    vision_image=step3_img,
+                    extracted_text=extracted,
+                    image_context=image_context,
+                )
         except Exception as exc:
             warnings.append(f"step3_vision_failed: {exc}")
             stability_stats["step3_vision_failed"] += 1
@@ -1793,168 +4131,266 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                 "confidence": "low",
             }
 
-        step4_primary_failed = False
-        try:
-            en = run_step4_generate_copy_language(
-                chat=chat,
-                model=args.english_copy_model,
-                structured_attributes=structured,
-                extracted_text=extracted,
-                user_copy_instructions=user_copy_resolved,
-                target="canadian_english",
-            )
-        except Exception as exc:
-            step4_primary_failed = True
-            warnings.append(f"step4_copy_en_primary_failed: {exc}")
-            try:
-                en = run_step4_generate_copy_language(
-                    chat=chat,
-                    model=args.fallback_english_copy_model,
-                    structured_attributes=structured,
-                    extracted_text=extracted,
-                    user_copy_instructions=user_copy_resolved,
-                    target="canadian_english",
-                )
-                warnings.append(f"step4_copy_en_fallback_used: {args.fallback_english_copy_model}")
-                stability_stats["step4_copy_fallback_used"] += 1
-            except Exception as fb_exc:
-                warnings.append(f"step4_copy_en_failed: {fb_exc}")
-                stability_stats["step4_copy_fallback_failed"] += 1
-                en = LocalizedListing(
-                    title="Fallback: Product title in Canadian English",
-                    description="Fallback: Could not generate final English copy from model response.",
-                    category="Fallback: Category > Subcategory",
-                    key_attributes={"status": "fallback"},
-                )
+        structured = enrich_structured_attributes_from_ocr(extracted, structured)
+        if structured.get("confidence") == "medium_ocr_fallback":
+            warnings.append("structured_attributes_enriched_from_ocr: vision step unavailable or weak; filled gaps from on-image text")
 
-        try:
-            fr = run_step4_generate_copy_language(
-                chat=chat,
-                model=args.french_copy_model,
-                structured_attributes=structured,
-                extracted_text=extracted,
-                user_copy_instructions=user_copy_resolved,
-                target="canadian_french",
-            )
-        except Exception as exc:
-            step4_primary_failed = True
-            warnings.append(f"step4_copy_fr_primary_failed: {exc}")
-            try:
-                fr = run_step4_generate_copy_language(
+        # Step5: prepare additional marketing images generation task. This can run in
+        # parallel with Step4 (listing) and Step4b/4c (reviews) once Step3 is done.
+        additional_images: List[str] = list(pre_additional_paths)
+        extras_future = None
+        if args.generate_additional_images and final_path:
+            n_extra = max(0, int(args.additional_image_count))
+            need = max(0, n_extra - len(additional_images))
+
+            if need > 0:
+                def _extra_images_task() -> Tuple[List[str], List[str]]:
+                    local_warnings: List[str] = []
+                    more_paths: List[str] = []
+                    try:
+                        more_paths = generate_additional_product_images(
+                            rq=rq,
+                            source_for_generation=final_path,
+                            product_id=product_id,
+                            out_dir=work_img_dir,
+                            model=args.additional_image_model,
+                            count=need,
+                            structured_attributes=structured,
+                            user_image_instructions=user_image_resolved,
+                            scenario_offset=1 if pre_additional_paths else 0,
+                            first_file_index=len(additional_images) + 1,
+                            warnings=local_warnings,
+                            fallback_model=getattr(args, "fallback_additional_image_model", None) or None,
+                        )
+                        if len(more_paths) < need:
+                            local_warnings.append(
+                                f"extra_images_shortfall: requested {need} from RQ model {args.additional_image_model!r}, "
+                                f"got {len(more_paths)}. Try --fallback-additional-image-model / GMI_FALLBACK_IMAGE_MODEL, "
+                                "GMI_EXTRA_IMAGES_SEEDREAM_USE_EDIT_FALLBACK=1 (Seedream), GMI_EXTRA_IMAGES_USE_EDIT_FALLBACK, "
+                                "GMI_RQ_OUTCOME_DEBUG=1, lower GMI_EXTRA_IMAGES_MAX_PARALLEL, or GMI_EXTRA_IMAGES_BATCH=0; "
+                                "see generate_additional_product_images docstring and stderr for extra_images_rq_* lines."
+                            )
+                    except Exception as exc:
+                        local_warnings.append(f"extra_images_failed: {exc}")
+                    return more_paths, local_warnings
+
+                extras_future = executor.submit(_extra_images_task)
+        elif args.generate_additional_images and not final_path:
+            warnings.append("extra_images_skipped_no_final_path")
+
+        step4_primary_failed = False
+        cleaned_listing_image: Optional[Path] = final_path or erased_path
+        s4_model = (
+            str(args.unified_copy_model) if args.copy_generation_mode == "unified" else str(args.english_copy_model)
+        )
+        with pipeline_progress_span(
+            "step4_listing",
+            model=s4_model,
+            product_id=product_id,
+            detail=str(args.copy_generation_mode),
+        ):
+            if args.copy_generation_mode == "unified":
+                warnings.append("step4_copy_generation_mode_unified")
+                try:
+                    en, fr = run_step4_generate_listing_dual_image_bilingual(
+                        chat=chat,
+                        model=args.unified_copy_model,
+                        source_image=source_image,
+                        cleaned_image=cleaned_listing_image,
+                        structured_attributes=structured,
+                        extracted_text=extracted,
+                        user_copy_instructions=user_copy_resolved,
+                        warnings=warnings,
+                    )
+                    if _step4_copy_listing_degenerate(en) or _step4_copy_listing_degenerate(fr):
+                        raise RuntimeError("step4_unified_degenerate_listing")
+                except Exception as exc:
+                    step4_primary_failed = True
+                    warnings.append(f"step4_unified_copy_primary_failed: {exc}")
+                    try:
+                        en, fr = run_step4_generate_listing_dual_image_bilingual(
+                            chat=chat,
+                            model=args.fallback_english_copy_model,
+                            source_image=source_image,
+                            cleaned_image=cleaned_listing_image,
+                            structured_attributes=structured,
+                            extracted_text=extracted,
+                            user_copy_instructions=user_copy_resolved,
+                            warnings=warnings,
+                        )
+                        if _step4_copy_listing_degenerate(en) or _step4_copy_listing_degenerate(fr):
+                            raise RuntimeError("step4_unified_fallback_degenerate_listing")
+                        warnings.append(f"step4_unified_copy_fallback_used: {args.fallback_english_copy_model}")
+                        stability_stats["step4_copy_fallback_used"] += 1
+                    except Exception as fb_exc:
+                        warnings.append(f"step4_unified_copy_fallback_failed: {fb_exc}")
+                        stability_stats["step4_copy_fallback_failed"] += 1
+                        en = build_step4_heuristic_listing(structured, extracted, "canadian_english")
+                        fr = build_step4_heuristic_listing(structured, extracted, "canadian_french")
+                        warnings.append("step4_unified_heuristic_used_after_model_failure")
+            else:
+                warnings.append("step4_copy_generation_mode_split_dual_image")
+                try:
+                    en, fr = run_step4_generate_listing_dual_image_bilingual(
+                        chat=chat,
+                        model=args.english_copy_model,
+                        source_image=source_image,
+                        cleaned_image=cleaned_listing_image,
+                        structured_attributes=structured,
+                        extracted_text=extracted,
+                        user_copy_instructions=user_copy_resolved,
+                        warnings=warnings,
+                    )
+                    if _step4_copy_listing_degenerate(en) or _step4_copy_listing_degenerate(fr):
+                        raise RuntimeError("step4_split_dual_degenerate_listing")
+                except Exception as exc:
+                    step4_primary_failed = True
+                    warnings.append(f"step4_split_dual_copy_primary_failed: {exc}")
+                    try:
+                        en, fr = run_step4_generate_listing_dual_image_bilingual(
+                            chat=chat,
+                            model=args.fallback_english_copy_model,
+                            source_image=source_image,
+                            cleaned_image=cleaned_listing_image,
+                            structured_attributes=structured,
+                            extracted_text=extracted,
+                            user_copy_instructions=user_copy_resolved,
+                            warnings=warnings,
+                        )
+                        if _step4_copy_listing_degenerate(en) or _step4_copy_listing_degenerate(fr):
+                            raise RuntimeError("step4_split_dual_fallback_degenerate_listing")
+                        warnings.append(f"step4_split_dual_copy_fallback_used: {args.fallback_english_copy_model}")
+                        stability_stats["step4_copy_fallback_used"] += 1
+                    except Exception as fb_exc:
+                        warnings.append(f"step4_split_dual_copy_fallback_failed: {fb_exc}")
+                        stability_stats["step4_copy_fallback_failed"] += 1
+                        en = build_step4_heuristic_listing(structured, extracted, "canadian_english")
+                        fr = build_step4_heuristic_listing(structured, extracted, "canadian_french")
+                        warnings.append("step4_split_dual_heuristic_used_after_model_failure")
+
+                en, fr = _apply_simple_copy_recovery_if_needed(
                     chat=chat,
-                    model=args.fallback_french_copy_model,
-                    structured_attributes=structured,
-                    extracted_text=extracted,
-                    user_copy_instructions=user_copy_resolved,
-                    target="canadian_french",
-                )
-                warnings.append(f"step4_copy_fr_fallback_used: {args.fallback_french_copy_model}")
-                stability_stats["step4_copy_fallback_used"] += 1
-            except Exception as fb_exc:
-                warnings.append(f"step4_copy_fr_failed: {fb_exc}")
-                stability_stats["step4_copy_fallback_failed"] += 1
-                fr = LocalizedListing(
-                    title="Repli : Titre produit en francais canadien",
-                    description="Repli : Impossible de generer la copie francaise finale depuis le modele.",
-                    category="Repli : Categorie > Sous-categorie",
-                    key_attributes={"etat": "repli"},
+                    args=args,
+                    structured=structured,
+                    extracted=extracted,
+                    user_copy_resolved=user_copy_resolved,
+                    en=en,
+                    fr=fr,
+                    warnings=warnings,
+                    listing_image=step3_img,
                 )
 
         if step4_primary_failed:
             stability_stats["step4_copy_failed"] += 1
 
         copy_review: Optional[Dict[str, Any]] = None
-        try:
-            copy_review, cr_side_failed = run_step4b_review_copy_bilingual(
-                chat=chat,
-                model_english=args.copy_review_english_model,
-                model_french=args.copy_review_french_model,
-                product_id=product_id,
-                source_image=source_image,
-                structured_attributes=structured,
-                en=en,
-                fr=fr,
-                user_copy_instructions=user_copy_resolved,
-            )
-            if cr_side_failed:
-                warnings.append("step4b_copy_review_partial_failure: one or both reviewer calls failed")
-                stability_stats["step4b_copy_review_failed"] += 1
-            status = str(copy_review.get("overall_status", "")).lower()
-            if status == "fail":
-                warnings.append(f"copy_review_fail: {copy_review.get('summary', '')}")
-                stability_stats["copy_review_fail"] += 1
-            elif status == "revise":
-                warnings.append(f"copy_review_revise: {copy_review.get('summary', '')}")
-                stability_stats["copy_review_revise"] += 1
-        except Exception as exc:
-            warnings.append(f"step4b_copy_review_failed: {exc}")
-            stability_stats["step4b_copy_review_failed"] += 1
-            copy_review = {
-                "overall_status": "revise",
-                "summary": f"Reviewer call failed: {exc}",
-                "exaggeration_findings": [],
-                "attribute_conflicts": [],
-                "image_visual_mismatches": [],
-                "en_revision_suggestions": "",
-                "fr_revision_suggestions": "",
-                "scores": {},
-            }
-
         locale_grammar_review: Optional[Dict[str, Any]] = None
-        try:
-            locale_grammar_review = run_step4c_locale_grammar_review(
-                chat=chat,
-                model_english=args.locale_grammar_english_model,
-                model_french=args.locale_grammar_french_model,
-                en=en,
-                fr=fr,
-            )
-            en_g = locale_grammar_review.get("canadian_english", {})
-            fr_g = locale_grammar_review.get("canadian_french", {})
-            if not isinstance(en_g, dict):
-                en_g = {}
-            if not isinstance(fr_g, dict):
-                fr_g = {}
-            en_s = str(en_g.get("status", "pass")).lower()
-            fr_s = str(fr_g.get("status", "pass")).lower()
-            if en_s == "fail" or fr_s == "fail":
-                warnings.append(
-                    "locale_grammar_fail: "
-                    f"en={en_s} fr={fr_s}; "
-                    f"en: {(en_g.get('notes') or '')[:160]} | fr: {(fr_g.get('notes') or '')[:160]}"
-                )
-                stability_stats["locale_grammar_fail"] += 1
-            elif en_s == "revise" or fr_s == "revise":
-                warnings.append(f"locale_grammar_revise: en={en_s} fr={fr_s}")
-                stability_stats["locale_grammar_revise"] += 1
-        except Exception as exc:
-            warnings.append(f"step4c_locale_grammar_failed: {exc}")
-            stability_stats["step4c_locale_grammar_failed"] += 1
-            fb = _normalize_locale_grammar_block(
-                {
-                    "status": "revise",
-                    "issues": [str(exc)],
-                    "suggested_edits": "",
-                    "notes": "Locale grammar reviewer call failed.",
-                }
-            )
-            locale_grammar_review = {"canadian_english": fb, "canadian_french": {**fb}}
-
-        additional_images: List[str] = []
-        if args.generate_additional_images:
+        if getattr(args, "skip_listing_review", False):
+            warnings.append("listing_review_skipped: Step4b and Step4c not run (--skip-listing-review or GMI_SKIP_LISTING_REVIEW)")
+        else:
             try:
-                additional_images = generate_additional_product_images(
-                    rq=rq,
-                    source_for_generation=final_path,
+                with pipeline_progress_span(
+                    "step4b_copy_review",
+                    model=f"{args.copy_review_english_model} + {args.copy_review_french_model}",
                     product_id=product_id,
-                    out_dir=work_img_dir,
-                    model=args.additional_image_model,
-                    count=args.additional_image_count,
-                    structured_attributes=structured,
-                    user_image_instructions=user_image_resolved,
-                )
+                ):
+                    copy_review, cr_side_failed = run_step4b_review_copy_bilingual(
+                        chat=chat,
+                        model_english=args.copy_review_english_model,
+                        model_french=args.copy_review_french_model,
+                        product_id=product_id,
+                        source_image=source_image,
+                        structured_attributes=structured,
+                        en=en,
+                        fr=fr,
+                        user_copy_instructions=user_copy_resolved,
+                    )
+                if cr_side_failed:
+                    warnings.append("step4b_copy_review_partial_failure: one or both reviewer calls failed")
+                    stability_stats["step4b_copy_review_failed"] += 1
+                status = str(copy_review.get("overall_status", "")).lower()
+                if status == "fail":
+                    warnings.append(f"copy_review_fail: {copy_review.get('summary', '')}")
+                    stability_stats["copy_review_fail"] += 1
+                elif status == "revise":
+                    warnings.append(f"copy_review_revise: {copy_review.get('summary', '')}")
+                    stability_stats["copy_review_revise"] += 1
             except Exception as exc:
-                warnings.append(f"extra_images_failed: {exc}")
+                warnings.append(f"step4b_copy_review_failed: {exc}")
+                stability_stats["step4b_copy_review_failed"] += 1
+                copy_review = {
+                    "overall_status": "revise",
+                    "summary": f"Reviewer call failed: {exc}",
+                    "exaggeration_findings": [],
+                    "attribute_conflicts": [],
+                    "image_visual_mismatches": [],
+                    "en_revision_suggestions": "",
+                    "fr_revision_suggestions": "",
+                    "scores": {},
+                }
+
+            try:
+                with pipeline_progress_span(
+                    "step4c_locale_grammar",
+                    model=f"{args.locale_grammar_english_model} + {args.locale_grammar_french_model}",
+                    product_id=product_id,
+                ):
+                    locale_grammar_review, lg_side_failed = run_step4c_locale_grammar_review(
+                        chat=chat,
+                        model_english=args.locale_grammar_english_model,
+                        model_french=args.locale_grammar_french_model,
+                        en=en,
+                        fr=fr,
+                    )
+                if lg_side_failed:
+                    warnings.append(
+                        "step4c_locale_grammar_partial_failure: one or both locale grammar reviewer calls failed"
+                    )
+                    stability_stats["step4c_locale_grammar_failed"] += 1
+                en_g = locale_grammar_review.get("canadian_english", {})
+                fr_g = locale_grammar_review.get("canadian_french", {})
+                if not isinstance(en_g, dict):
+                    en_g = {}
+                if not isinstance(fr_g, dict):
+                    fr_g = {}
+                en_s = str(en_g.get("status", "pass")).lower()
+                fr_s = str(fr_g.get("status", "pass")).lower()
+                if en_s == "fail" or fr_s == "fail":
+                    warnings.append(
+                        "locale_grammar_fail: "
+                        f"en={en_s} fr={fr_s}; "
+                        f"en: {(en_g.get('notes') or '')[:160]} | fr: {(fr_g.get('notes') or '')[:160]}"
+                    )
+                    stability_stats["locale_grammar_fail"] += 1
+                elif en_s == "revise" or fr_s == "revise":
+                    warnings.append(f"locale_grammar_revise: en={en_s} fr={fr_s}")
+                    stability_stats["locale_grammar_revise"] += 1
+            except Exception as exc:
+                warnings.append(f"step4c_locale_grammar_failed: {exc}")
+                stability_stats["step4c_locale_grammar_failed"] += 1
+                fb = _normalize_locale_grammar_block(
+                    {
+                        "status": "revise",
+                        "issues": [str(exc)],
+                        "suggested_edits": "",
+                        "notes": "Locale grammar reviewer call failed.",
+                    }
+                )
+                locale_grammar_review = {"canadian_english": fb, "canadian_french": {**fb}}
+
+        # Join additional image generation (if scheduled) and merge warnings.
+        if extras_future is not None:
+            fb_x = getattr(args, "fallback_additional_image_model", "") or ""
+            with pipeline_progress_span(
+                "step5_marketing_extras",
+                model=str(args.additional_image_model),
+                product_id=product_id,
+                detail=(f"fallback={fb_x}" if fb_x.strip() else "no_fallback_model"),
+            ):
+                more_paths, extra_warnings = extras_future.result()
+            additional_images.extend(more_paths)
+            if extra_warnings:
+                warnings.extend(extra_warnings)
 
         artifacts.append(
             EcommerceArtifact(
@@ -1978,6 +4414,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                 additional_generated_images=additional_images or None,
                 copy_review=copy_review,
                 locale_grammar_review=locale_grammar_review,
+                listing_reference_audit=listing_ref_audit,
                 user_copy_instructions=user_copy_resolved,
                 user_image_instructions=user_image_resolved,
             )
@@ -1988,6 +4425,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         for w in warnings:
             if w.startswith("overlay_classifier_failed:"):
                 stability_stats["overlay_classifier_failed"] += 1
+        pipeline_progress_emit("sku", "item_end", product_id=product_id)
         if (stability_stats["processed"] % stability_update_every) == 0:
             snap = _build_stability_snapshot(stability_stats, len(input_items), run_started_at)
             _write_stability_reports(snap, stability_json_path, stability_md_path)
@@ -1996,13 +4434,39 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                 f"step4_failed={snap['step4_copy_failed']} fallback_used={snap['step4_copy_fallback_used']}"
             )
 
-    out_path = write_output(artifacts, Path(args.output))
+    # Ensure any background tasks are fully settled before writing outputs.
+    executor.shutdown(wait=True)
+    with pipeline_progress_span("write_output", detail=str(args.output)):
+        out_path = write_output(artifacts, Path(args.output))
     final_snap = _build_stability_snapshot(stability_stats, len(input_items), run_started_at)
     _write_stability_reports(final_snap, stability_json_path, stability_md_path)
     if args.export_deliverables:
-        index_csv = export_deliverables(artifacts, Path(args.deliverable_dir))
+        with pipeline_progress_span("export_deliverables", detail=str(args.deliverable_dir)):
+            index_csv = export_deliverables(artifacts, Path(args.deliverable_dir))
         print(f"Saved deliverable packages index to {index_csv}")
+    pipeline_progress_emit("pipeline", "run_complete", detail=str(out_path))
     return out_path
+
+
+def _default_copy_generation_mode() -> str:
+    v = (os.getenv("GMI_COPY_GENERATION_MODE") or "unified").strip().lower()
+    return v if v in ("split", "unified") else "unified"
+
+
+def _normalize_embedded_argv(argv: Sequence[str]) -> List[str]:
+    """Prepare argv for ``ArgumentParser.parse_args(args)`` when *args* is passed explicitly.
+
+    If *args* is ``None``, the parser uses ``sys.argv[1:]`` (shell already dropped the script name).
+
+    If *args* is a list/tuple, **every** element is parsed as a flag or value — there is **no**
+    implicit program name. A common mistake is to pass ``["mtwi_ecommerce_pipeline", "--foo", ...]``
+    mimicking ``sys.argv``; the first token is then reported as an *unrecognized argument* and
+    argparse exits with code 2. We strip **one** leading token iff it does not start with ``-``.
+    """
+    out = list(argv)
+    if out and not str(out[0]).startswith("-"):
+        out.pop(0)
+    return out
 
 
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
@@ -2027,9 +4491,19 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default="outputs/deliverables",
         help="Output directory for packaged deliverables.",
     )
+    parser.add_argument(
+        "--pipeline-progress-file",
+        default=os.getenv("GMI_PIPELINE_PROGRESS_FILE") or None,
+        help="Append JSONL progress events (also mirrors human lines to stderr). Overrides GMI_PIPELINE_PROGRESS_FILE.",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Limit number of products")
     parser.add_argument("--mock", action="store_true", help="Run in mock mode")
-    parser.add_argument("--max-attempts", type=int, default=2, help="Max retry attempts per external model/API call.")
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=2,
+        help="Max retry attempts per external model/API call (capped at 2).",
+    )
     parser.add_argument(
         "--stability-update-every",
         type=int,
@@ -2053,8 +4527,9 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--erase-strategy",
         choices=["local", "model"],
-        default=os.getenv("GMI_ERASE_STRATEGY", "local"),
-        help="Text erase strategy: local deterministic (recommended) or model-based.",
+        default=os.getenv("GMI_ERASE_STRATEGY", "model"),
+        help="Text erase: model = Request Queue (default; same default ID as --additional-image-model for quality). "
+        "local = white+inpaint/OpenCV (no RQ erase call).",
     )
     parser.add_argument(
         "--quality-strategy",
@@ -2078,10 +4553,20 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default=os.getenv("GMI_HARMONIZE_MODEL", "bria-fibo-edit"),
         help="Model used to harmonize artifact regions after text removal.",
     )
-    parser.add_argument(
+    parser.set_defaults(generate_additional_images=False)
+    _gen_img = parser.add_mutually_exclusive_group()
+    _gen_img.add_argument(
         "--generate-additional-images",
+        dest="generate_additional_images",
         action="store_true",
-        help="Generate additional same-product images from repaired image.",
+        help="Generate marketing variants via Request Queue (default: off). Use --additional-image-count (default 3). "
+        "For a dedicated RQ-only step after the main run, see src/run_marketing_extras_step.py.",
+    )
+    _gen_img.add_argument(
+        "--no-generate-additional-images",
+        dest="generate_additional_images",
+        action="store_false",
+        help="Skip extra same-product shots (default).",
     )
     parser.add_argument(
         "--additional-image-model",
@@ -2095,18 +4580,69 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="How many additional product images to generate.",
     )
     parser.add_argument(
+        "--fallback-additional-image-model",
+        default=(os.getenv("GMI_FALLBACK_IMAGE_MODEL") or "").strip(),
+        help="Optional second Request Queue model for marketing extras when the primary returns empty or echoes "
+        "the reference (env: GMI_FALLBACK_IMAGE_MODEL). Empty = disabled.",
+    )
+    parser.add_argument(
         "--mask-mode",
-        default=os.getenv("GMI_MASK_MODE", "overlay"),
+        default=os.getenv("GMI_MASK_MODE", "all"),
         choices=["overlay", "all"],
-        help="When using mask, choose which text boxes to erase: overlay-only (keep product-printed text) or all.",
+        help="With quad mask: 'all' = erase every annotated box (MTWI default). "
+        "'overlay' = VLM + heuristics pick overlay/watermark boxes only (live); mock overlay falls back to all if heuristics match nothing.",
+    )
+    parser.set_defaults(annotation_audit=True)
+    _ann_audit = parser.add_mutually_exclusive_group()
+    _ann_audit.add_argument(
+        "--annotation-audit",
+        dest="annotation_audit",
+        action="store_true",
+        help="Before erase (live): VLM validates each MTWI quad+transcript and selects which boxes to inpaint; "
+        "skips misaligned boxes. Mock mode always skips this step.",
+    )
+    _ann_audit.add_argument(
+        "--no-annotation-audit",
+        dest="annotation_audit",
+        action="store_false",
+        help="Skip pre-erase VLM audit; use --mask-mode only (all vs overlay) to choose boxes.",
+    )
+    parser.add_argument(
+        "--annotation-audit-model",
+        default=os.getenv("GMI_ANNOTATION_AUDIT_MODEL") or "",
+        help="VLM for MTWI annotation audit (default: same as --vision-model).",
     )
 
-    parser.add_argument("--eraser-model", default=os.getenv("GMI_ERASER_MODEL", "bria-eraser"), help="Step1 model")
+    parser.add_argument(
+        "--eraser-model",
+        default=None,
+        help="Step1 model erase (default: GMI_ERASER_MODEL if set, else same as --additional-image-model).",
+    )
     parser.add_argument("--restore-model", default=os.getenv("GMI_RESTORE_MODEL", "bria-fibo-restore"), help="Step2 model")
     parser.add_argument(
         "--vision-model",
         default=os.getenv("GMI_VISION_MODEL", "Qwen/Qwen3-VL-235B"),
         help="Step3 VLM (multimodal structured attributes).",
+    )
+    parser.add_argument(
+        "--copy-understand-image",
+        choices=["final", "source", "extra1"],
+        default=os.getenv("GMI_COPY_UNDERSTAND_IMAGE", "final"),
+        help="Image for Step3 before copy: cleaned main (final), raw listing (source), or first marketing extra "
+        "(extra1: pre-generates extra_1, runs VLM audit vs original, then Step3 on extra_1 if safe).",
+    )
+    parser.add_argument(
+        "--copy-generation-mode",
+        choices=["split", "unified"],
+        default=_default_copy_generation_mode(),
+        help="Step4: unified (default) = dual-image bilingual structured listing. split = same dual-image call but primary model "
+        "is --english-copy-model (not per-locale parallel); then simple recovery.",
+    )
+    parser.add_argument(
+        "--unified-copy-model",
+        default=os.getenv("GMI_UNIFIED_COPY_MODEL")
+        or os.getenv("GMI_ENGLISH_COPY_MODEL", "openai/gpt-5.4-pro"),
+        help="Primary model when --copy-generation-mode unified (default: same as --english-copy-model / GPT-5.4-pro).",
     )
     parser.add_argument(
         "--english-copy-model",
@@ -2129,9 +4665,20 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="If --french-copy-model fails, retry French generation with this model.",
     )
     parser.add_argument(
+        "--simple-copy-model",
+        default=os.getenv("GMI_SIMPLE_COPY_MODEL")
+        or os.getenv("GMI_FALLBACK_ENGLISH_COPY_MODEL", "openai/gpt-5.4-mini"),
+        help="One-shot bilingual EN+FR JSON recovery when split copy falls back to heuristics (no response_format).",
+    )
+    parser.add_argument(
+        "--no-simple-copy-recovery",
+        action="store_true",
+        help="Disable simple bilingual recovery (default: recovery is on when heuristics or empty descriptions are used).",
+    )
+    parser.add_argument(
         "--copy-review-english-model",
-        default=os.getenv("GMI_COPY_REVIEW_ENGLISH_MODEL", "openai/gpt-5.4"),
-        help="Step4b vision JSON audit for English listing vs image (required).",
+        default=os.getenv("GMI_COPY_REVIEW_ENGLISH_MODEL", "anthropic/claude-sonnet-4.6"),
+        help="Step4b vision JSON audit for English listing vs image (required). Default same family as --copy-review-french-model.",
     )
     parser.add_argument(
         "--copy-review-french-model",
@@ -2147,6 +4694,11 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--locale-grammar-french-model",
         default=os.getenv("GMI_LOCALE_GRAMMAR_FRENCH_MODEL", "openai/gpt-5.4-nano"),
         help="Step4c text JSON Canadian French grammar review (required).",
+    )
+    parser.add_argument(
+        "--skip-listing-review",
+        action="store_true",
+        help="Skip Step4b copy review and Step4c locale grammar (no extra chat calls; no review markdown in deliverables).",
     )
     parser.add_argument(
         "--user-copy-instructions",
@@ -2170,9 +4722,26 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default=None,
         help="UTF-8 file whose contents replace inline --user-image-instructions when the file exists.",
     )
-    args = parser.parse_args(argv)
+    argv_for_parser = None if argv is None else _normalize_embedded_argv(list(argv))
+    args = parser.parse_args(argv_for_parser)
+    args.max_attempts = max(1, min(2, int(args.max_attempts)))
+    skip_rev = (os.getenv("GMI_SKIP_LISTING_REVIEW") or "").strip().lower()
+    if skip_rev in ("1", "true", "yes", "on"):
+        args.skip_listing_review = True
+    if getattr(args, "eraser_model", None) is None:
+        args.eraser_model = (os.getenv("GMI_ERASER_MODEL") or "").strip() or args.additional_image_model
     if args.no_harmonize_after_erase:
         args.harmonize_after_erase = False
+    gai_env = (os.getenv("GMI_GENERATE_ADDITIONAL_IMAGES") or "").strip().lower()
+    if gai_env in ("0", "false", "no", "off"):
+        args.generate_additional_images = False
+    elif gai_env in ("1", "true", "yes", "on"):
+        args.generate_additional_images = True
+    aa_env = (os.getenv("GMI_ANNOTATION_AUDIT") or "").strip().lower()
+    if aa_env in ("0", "false", "no", "off"):
+        args.annotation_audit = False
+    elif aa_env in ("1", "true", "yes", "on"):
+        args.annotation_audit = True
     return args
 
 

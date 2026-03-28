@@ -14,6 +14,8 @@ from __future__ import annotations
 import argparse
 import csv
 import re
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -134,9 +136,26 @@ def main() -> None:
     samples = yaml.safe_load(Path(args.samples_yaml).read_text(encoding="utf-8")) or []
     if not isinstance(samples, list):
         raise ValueError("Samples YAML must be a list")
-    rows = [evaluate_one(s) for s in samples]
+    t_run = time.perf_counter()
+    print(f"[eval_copy] start {datetime.now().astimezone().isoformat()}  samples={len(samples)}", flush=True)
+    rows = []
+    for s in samples:
+        pid = str(s.get("product_id", "?"))
+        t0 = time.perf_counter()
+        row = evaluate_one(s)
+        dt = time.perf_counter() - t0
+        rows.append(row)
+        print(
+            f"[eval_copy] {pid}  {dt:.3f}s  overall={row['copy_quality_score']:.3f}  "
+            f"en={row['en_score']:.3f}  fr={row['fr_score']:.3f}",
+            flush=True,
+        )
     write_csv(rows, Path(args.output_csv))
     write_md(rows, Path(args.output_md))
+    scores = [float(r["copy_quality_score"]) for r in rows]
+    mean_o = sum(scores) / len(scores) if scores else 0.0
+    total_dt = time.perf_counter() - t_run
+    print(f"[eval_copy] done {datetime.now().astimezone().isoformat()}  total={total_dt:.2f}s  mean_overall={mean_o:.3f}", flush=True)
     print(f"Wrote copy metrics CSV: {args.output_csv}")
     print(f"Wrote copy metrics Markdown: {args.output_md}")
 
