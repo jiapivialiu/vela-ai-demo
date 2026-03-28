@@ -1,0 +1,153 @@
+{
+  "product_id": "T1.MlmFvtbXXXXXXXX_!!0-item_pic.jpg",
+  "source_image_path": "data/mtwi_train/image_train/T1.MlmFvtbXXXXXXXX_!!0-item_pic.jpg.jpg",
+  "erased_image_path": "outputs/mtwi_images/T1.MlmFvtbXXXXXXXX_!!0-item_pic.jpg_erased.png",
+  "final_image_path": "outputs/mtwi_images/T1.MlmFvtbXXXXXXXX_!!0-item_pic.jpg_final.png",
+  "extracted_text": [
+    "7.4v2200nAH",
+    "FORSONYNP-FSSO",
+    "BATTERYPACK",
+    "天猫",
+    "升级版",
+    "小巧高亮",
+    "自由调节高度",
+    "配送一电一充",
+    "酷搜",
+    "LED-5009",
+    "补光灯",
+    "送两色温片"
+  ],
+  "structured_attributes": {
+    "product_type": "LED light",
+    "category_hint": "Photography accessories",
+    "material": "Plastic and electronic components",
+    "key_features": [
+      "Upgraded version",
+      "Compact and bright",
+      "Adjustable height",
+      "Includes one battery and one charger",
+      "Two color temperature filters included"
+    ],
+    "size_or_specs": [
+      "7.4V 2200mAh battery",
+      "Model: LED-5009"
+    ],
+    "brand_or_series": "Kusou",
+    "confidence": "high"
+  },
+  "canadian_english": {
+    "title": "Kusou LED Light - Upgraded Version",
+    "description": "The Kusou LED light is an upgraded version designed for photography enthusiasts. It is compact and bright, featuring adjustable height for versatile use. This package includes one battery and one charger, along with two color temperature filters to enhance your lighting options.",
+    "category": "Photography Accessories/LED Lights",
+    "key_attributes": {
+      "material": "Plastic and electronic components",
+      "key_features": "['Upgraded version', 'Compact and bright', 'Adjustable height', 'Includes one battery and one charger', 'Two color temperature filters included']",
+      "size_or_specs": "['7.4V 2200mAh battery', 'Model: LED-5009']",
+      "brand_or_series": "Kusou",
+      "confidence": "high"
+    }
+  },
+  "canadian_french": {
+    "title": "Lumière LED Kusou - Version Améliorée",
+    "description": "La lumière LED Kusou est une version améliorée conçue pour les passionnés de photographie. Elle est compacte et lumineuse, avec une hauteur réglable pour une utilisation polyvalente. Cet ensemble comprend une batterie et un chargeur, ainsi que deux filtres de température de couleur pour améliorer vos options d'éclairage.",
+    "category": "Accessoires de Photographie/Lumières LED",
+    "key_attributes": {
+      "material": "Plastique et composants électroniques",
+      "key_features": "['Version améliorée', 'Compacte et lumineuse', 'Hauteur réglable', 'Comprend une batterie et un chargeur', 'Deux filtres de température de couleur inclus']",
+      "size_or_specs": "['Batterie 7.4V 2200mAh', 'Modèle : LED-5009']",
+      "brand_or_series": "Kusou",
+      "confidence": "élevé"
+    }
+  },
+  "warnings": [
+    "step4_copy_failed: 500 Server Error: Internal Server Error for url: https://api.gmi-serving.com/v1/chat/completions",
+    "step4_copy_fallback_model_used: openai/gpt-4o-mini"
+  ],
+  "erased_spans": [
+    {
+      "index": 10,
+      "text": "天猫",
+      "bbox": [
+        32.44,
+        737.78,
+        105.33,
+        774.22
+      ]
+    },
+    {
+      "index": 11,
+      "text": "升级版",
+      "bbox": [
+        393.33,
+        127.11,
+        684.89,
+        211.56
+      ]
+    },
+    {
+      "index": 12,
+      "text": "小巧高亮",
+      "bbox": [
+        22.67,
+        267.56,
+        221.78,
+        315.56
+      ]
+    },
+    {
+      "index": 13,
+      "text": "自由调节高度",
+      "bbox": [
+        22.67,
+        201.78,
+        292.89,
+        250.67
+      ]
+    },
+    {
+      "index": 14,
+      "text": "配送一电一充",
+      "bbox": [
+        22.67,
+        139.56,
+        298.22,
+        188.44
+      ]
+    },
+    {
+      "index": 15,
+      "text": "酷搜",
+      "bbox": [
+        21.78,
+        28.44,
+        175.56,
+        105.78
+      ]
+    },
+    {
+      "index": 17,
+      "text": "补光灯",
+      "bbox": [
+        550.67,
+        29.33,
+        783.56,
+        106.67
+      ]
+    },
+    {
+      "index": 18,
+      "text": "送两色温片",
+      "bbox": [
+        399.56,
+        704.0,
+        748.89,
+        763.56
+      ]
+    }
+  ],
+  "additional_generated_images": [
+    "outputs/mtwi_images/T1.MlmFvtbXXXXXXXX_!!0-item_pic.jpg_extra_1.png",
+    "outputs/mtwi_images/T1.MlmFvtbXXXXXXXX_!!0-item_pic.jpg_extra_2.png",
+    "outputs/mtwi_images/T1.MlmFvtbXXXXXXXX_!!0-item_pic.jpg_extra_3.png"
+  ]
+}

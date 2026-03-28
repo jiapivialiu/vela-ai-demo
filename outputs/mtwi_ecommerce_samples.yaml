@@ -1,0 +1,48 @@
+- product_id: T1.3BPFFJdXXXXXXXX_!!0-item_pic.jpg
+  source_image_path: data/mtwi_train/image_train/T1.3BPFFJdXXXXXXXX_!!0-item_pic.jpg.jpg
+  erased_image_path: outputs/mtwi_images/T1.3BPFFJdXXXXXXXX_!!0-item_pic.jpg_harmonized.png
+  final_image_path: outputs/mtwi_images/T1.3BPFFJdXXXXXXXX_!!0-item_pic.jpg_final.png
+  extracted_text:
+  - 薄利汽配
+  - 五菱荣光前外拉手颜色齐全
+  structured_attributes:
+    product_type: Unknown
+    category_hint: General Merchandise
+    material: ''
+    key_features:
+    - 薄利汽配
+    - 五菱荣光前外拉手颜色齐全
+    size_or_specs: []
+    brand_or_series: ''
+    confidence: low
+  canadian_english:
+    title: 'Mock: Product title in Canadian English'
+    description: 'Mock: Product description in Canadian English based on structured
+      attributes.'
+    category: 'Mock: Category > Subcategory'
+    key_attributes:
+      feature_1: mock
+  canadian_french:
+    title: 'Maquette : Titre produit en francais canadien'
+    description: 'Maquette : Description produit en francais canadien selon les attributs
+      structures.'
+    category: 'Maquette : Categorie > Sous-categorie'
+    key_attributes:
+      caracteristique_1: maquette
+  warnings: []
+  erased_spans: []
+  additional_generated_images: null
+  copy_review: null
+  locale_grammar_review:
+    canadian_english:
+      status: pass
+      issues: []
+      suggested_edits: ''
+      notes: 'Mock: skipped.'
+    canadian_french:
+      status: pass
+      issues: []
+      suggested_edits: ''
+      notes: 'Mock: skipped.'
+  user_copy_instructions: ''
+  user_image_instructions: ''

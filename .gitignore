@@ -1,0 +1,21 @@
+# Local API credential file (do not commit real keys)
+credentials.json
+
+# Local virtualenv
+.venv/
+
+# Cursor project rules (keep local for now)
+.cursor/
+.cursorrules
+
+# macOS metadata
+.DS_Store
+
+# large training set
+data/mtwi_train/
+
+# Streamlit UI runs
+outputs/streamlit_runs/
+
+# python
+__pycache__/
