@@ -1,0 +1,418 @@
+- product_id: demo_item
+  source_image_path: data/demo_one/image_train/demo_item.jpg
+  erased_image_path: outputs/mtwi_images_demo_one/demo_item_erased.png
+  final_image_path: outputs/mtwi_images_demo_one/demo_item_final.png
+  extracted_text:
+  - 康夫
+  - '8881'
+  - 专业吹风机
+  - 正品
+  - 包邮
+  - KANGFU
+  - '1900'
+  - Watts
+  - 功率
+  - 1900W
+  - 专业发型师信赖产品
+  - 送风嘴2个
+  - FU
+  structured_attributes:
+    product_type: hair dryer
+    category_hint: Personal care appliances
+    material: ''
+    key_features:
+    - 康夫
+    - '8881'
+    - 专业吹风机
+    - 正品
+    - 包邮
+    size_or_specs:
+    - 1900W
+    - Model 8881
+    - 2 styling nozzles included
+    brand_or_series: Kangfu
+    confidence: medium_ocr_fallback
+  canadian_english:
+    title: hair dryer — Personal care appliances
+    description: 'Draft listing assembled from vision + OCR because the copy models
+      did not return usable JSON.
+
+      Review and replace with verified marketing copy before publishing.
+
+
+      **Product type:** hair dryer
+
+      **Category:** Personal care appliances
+
+      **Brand / series:** Kangfu
+
+
+      **Highlights:**
+
+      - 8881
+
+
+      **Size / specs:**
+
+      - 1900W
+
+      - Model 8881
+
+      - 2 styling nozzles included
+
+
+      **On-image text (Latin / numbers only, Chinese stripped):**
+
+      - 8881
+
+      - KANGFU
+
+      - 1900
+
+      - Watts
+
+      - 1900W
+
+      - FU
+
+
+      *(Vision confidence: medium_ocr_fallback)*'
+    category: Personal care appliances
+    key_attributes:
+      param_brand: KANGFU
+      param_model: '8881'
+      param_product_type: hair dryer
+      param_power: 1900Watts
+      param_colour: Not specified
+      param_material: Not specified
+      param_dimensions: Not specified
+      param_included_accessories: 2 styling nozzles
+      param_certifications_visible: Not specified
+      param_country_of_origin: Not specified
+      param_warranty: Not specified
+      param_weight: Not specified
+      draft_source: heuristic_en
+      needs_human_review: 'true'
+  canadian_french:
+    title: Sèche-cheveux — Électroménager de soins personnels
+    description: 'Ébauche construite à partir de la vision et de l''OCR : les modèles
+      n''ont pas renvoyé de JSON exploitable.
+
+      À réviser avant publication.
+
+
+      **Type de produit :** Sèche-cheveux
+
+      **Catégorie :** Électroménager de soins personnels
+
+      **Marque / série :** Kangfu
+
+
+      **Points saillants :**
+
+      - 8881
+
+
+      **Taille / specs :**
+
+      - 1900W
+
+      - Model 8881
+
+      - 2 styling nozzles included
+
+
+      **Texte sur l''image (latin/chiffres seulement, chinois retiré) :**
+
+      - 8881
+
+      - KANGFU
+
+      - 1900
+
+      - Watts
+
+      - 1900W
+
+      - FU
+
+
+      *(Confiance vision : medium_ocr_fallback)*'
+    category: Électroménager de soins personnels
+    key_attributes:
+      param_brand: KANGFU
+      param_model: '8881'
+      param_product_type: Sèche-cheveux
+      param_power: 1900Watts
+      param_colour: Non précisé
+      param_material: Non précisé
+      param_dimensions: Non précisé
+      param_included_accessories: 2 buses de concentration
+      param_certifications_visible: Non précisé
+      param_country_of_origin: Non précisé
+      param_warranty: Non précisé
+      param_weight: Non précisé
+      source_brouillon: heuristique_fr
+      revision_requise: 'true'
+  warnings:
+  - 'annotation_audit_failed: 404 Client Error: Not Found for url: https://api.gmi-serving.com/v1/chat/completions'
+  - 'step3_vision_failed: 404 Client Error: Not Found for url: https://api.gmi-serving.com/v1/chat/completions'
+  - 'structured_attributes_enriched_from_ocr: vision step unavailable or weak; filled
+    gaps from on-image text'
+  - step4_copy_generation_mode_unified
+  - 'step4_unified_copy_primary_failed: 400 Client Error: Bad Request for url: https://api.gmi-serving.com/v1/chat/completions'
+  - 'step4_unified_copy_fallback_failed: 400 Client Error: Bad Request for url: https://api.gmi-serving.com/v1/chat/completions'
+  - step4_unified_heuristic_used_after_model_failure
+  - 'step4b_copy_review_partial_failure: one or both reviewer calls failed'
+  - 'copy_review_revise: EN: English copy reviewer call failed. | FR: The French listing
+    is a draft placeholder with mixed-language content and incomplete localization;
+    core facts (brand, model, wattage, 2 nozzles) are grounded but the description
+    is unpublishable as-is.'
+  - 'step4c_locale_grammar_failed: 400 Client Error: Bad Request for url: https://api.gmi-serving.com/v1/chat/completions'
+  - 'extra_images_placeholder: RQ model ''seedream-5.0-lite'' returned no images;
+    copied reference image for 3 slot(s) (not real marketing variants).'
+  - 'extra_images_placeholder_note: Distinct prompts were still sent per slot (different
+    angle studio / different application scenario no person / person-in-use lifestyle).
+    Identical files mean the API yielded no decodable image bytes, not that one prompt
+    was reused. Set GMI_EXTRA_IMAGES_DEBUG=1 to append per-request prompt digests
+    (sha + length + head) to these warnings. Set GMI_RQ_OUTCOME_DEBUG=1 to print RQ
+    outcome field shapes on stderr when decode fails (compare with console docs /
+    support).'
+  erased_spans:
+  - index: 0
+    text: 康夫
+    bbox:
+    - 16.73
+    - 15.58
+    - 107.48
+    - 60.5
+  - index: 1
+    text: '8881'
+    bbox:
+    - 109.77
+    - 19.71
+    - 199.15
+    - 57.29
+  - index: 2
+    text: 专业吹风机
+    bbox:
+    - 205.56
+    - 31.63
+    - 342.15
+    - 59.13
+  - index: 3
+    text: 正品
+    bbox:
+    - 378.35
+    - 26.13
+    - 440.23
+    - 56.83
+  - index: 4
+    text: 包邮
+    bbox:
+    - 446.19
+    - 11.46
+    - 538.31
+    - 58.67
+  - index: 5
+    text: KANGFU
+    bbox:
+    - 138.65
+    - 149.42
+    - 233.52
+    - 159.04
+  - index: 6
+    text: '8881'
+    bbox:
+    - 237.19
+    - 150.33
+    - 264.69
+    - 159.96
+  - index: 7
+    text: '1900'
+    bbox:
+    - 140.02
+    - 160.88
+    - 162.02
+    - 167.75
+  - index: 8
+    text: Watts
+    bbox:
+    - 163.4
+    - 163.63
+    - 197.77
+    - 169.13
+  - index: 9
+    text: '###'
+    bbox:
+    - 426.94
+    - 202.13
+    - 459.48
+    - 211.29
+  - index: 10
+    text: '###'
+    bbox:
+    - 428.77
+    - 213.58
+    - 447.1
+    - 222.29
+  - index: 11
+    text: '###'
+    bbox:
+    - 331.15
+    - 287.83
+    - 348.56
+    - 298.83
+  - index: 12
+    text: 功率
+    bbox:
+    - 9.85
+    - 263.08
+    - 111.15
+    - 317.17
+  - index: 13
+    text: 1900W
+    bbox:
+    - 108.4
+    - 266.75
+    - 279.81
+    - 313.5
+  - index: 14
+    text: 专业发型师信赖产品
+    bbox:
+    - 11.69
+    - 321.75
+    - 276.6
+    - 352.0
+  - index: 15
+    text: 送风嘴2个
+    bbox:
+    - 376.06
+    - 341.92
+    - 522.73
+    - 370.79
+  - index: 16
+    text: KANGFU
+    bbox:
+    - 96.48
+    - 475.29
+    - 152.85
+    - 510.13
+  - index: 17
+    text: '###'
+    bbox:
+    - 106.56
+    - 418.0
+    - 120.77
+    - 430.38
+  - index: 18
+    text: KANGFU
+    bbox:
+    - 55.23
+    - 474.83
+    - 81.81
+    - 503.71
+  - index: 19
+    text: '###'
+    bbox:
+    - 181.27
+    - 469.79
+    - 208.77
+    - 488.13
+  - index: 20
+    text: '###'
+    bbox:
+    - 123.98
+    - 410.67
+    - 144.6
+    - 423.96
+  - index: 21
+    text: FU
+    bbox:
+    - 135.44
+    - 354.29
+    - 157.9
+    - 363.92
+  additional_generated_images:
+  - outputs/mtwi_images_demo_one/demo_item_extra_1.png
+  - outputs/mtwi_images_demo_one/demo_item_extra_2.png
+  - outputs/mtwi_images_demo_one/demo_item_extra_3.png
+  copy_review:
+    overall_status: revise
+    summary: 'EN: English copy reviewer call failed. | FR: The French listing is a
+      draft placeholder with mixed-language content and incomplete localization; core
+      facts (brand, model, wattage, 2 nozzles) are grounded but the description is
+      unpublishable as-is.'
+    exaggeration_findings:
+    - No exaggerated claims detected; the listing avoids superlatives and unsupported
+      performance claims.
+    attribute_conflicts:
+    - param_power is listed as '1900Watts' (no space); image and attributes both confirm
+      '1900W' — formatting should be normalized to '1900 W'.
+    - param_included_accessories says '2 buses de concentration' but the structured
+      attribute says '2 styling nozzles included' — translation is acceptable but
+      should be verified against image (image shows 2 concentrator nozzles, consistent).
+    - Title 'Sèche-cheveux — Électroménager de soins personnels' omits brand and model,
+      which are confirmed by image; this creates a conflict with key_attributes that
+      do include them.
+    - source_brouillon and revision_requise are internal metadata fields exposed in
+      the public-facing key_attributes — these should be removed before publication.
+    image_visual_mismatches:
+    - Image clearly shows the KANGFU logo and model '8881' on the dryer body — the
+      title does not mention brand or model, which is a missed grounding opportunity
+      rather than a mismatch.
+    - Image shows a CCC certification mark on the dryer body; param_certifications_visible
+      is listed as 'Non précisé' — this is a factual omission (though CCC is a Chinese
+      market cert and may not be relevant for Canadian listing, it should at minimum
+      be noted or explicitly excluded).
+    - Image shows the dryer is black; param_colour is 'Non précisé' — colour is clearly
+      visible and should be populated as 'Noir'.
+    - Image shows a retail box with KANGFU branding; no Canadian safety certification
+      (CSA, cUL, or cETL) is visible — param_certifications_visible should flag this
+      absence explicitly for compliance review.
+    en_revision_suggestions: ''
+    fr_revision_suggestions: '• Mettre à jour le titre pour inclure la marque et le
+      modèle, ex. : ''Sèche-cheveux professionnel KANGFU 8881 — 1900 W''.
+
+      • Remplacer le corps de description par un texte rédigé en français canadien
+      correct, sans balises de brouillon ni avertissements internes.
+
+      • Corriger param_power : ''1900Watts'' → ''1900 W''.
+
+      • Renseigner param_colour : ''Noir'' (clairement visible sur l''image).
+
+      • Supprimer les champs internes source_brouillon et revision_requise de key_attributes
+      avant publication.
+
+      • Ajouter une note sur param_certifications_visible : indiquer ''Marque CCC
+      visible (marché chinois) — certification canadienne (CSA/cUL) non confirmée''
+      pour déclencher une vérification de conformité.
+
+      • Retirer les lignes de texte OCR brut (''8881, KANGFU, 1900, Watts, FU'') de
+      la description publique — ces données appartiennent aux métadonnées internes
+      uniquement.
+
+      • Vérifier et compléter param_dimensions et param_weight à partir de la fiche
+      technique du fabricant avant publication.
+
+      • S''assurer que ''2 buses de concentration'' correspond bien aux accessoires
+      physiques inclus dans l''emballage canadien.'
+    scores:
+      grounding: 0.5
+      factual_tone: 0.5
+  locale_grammar_review:
+    canadian_english:
+      status: revise
+      issues:
+      - '400 Client Error: Bad Request for url: https://api.gmi-serving.com/v1/chat/completions'
+      suggested_edits: ''
+      notes: Locale grammar reviewer call failed.
+    canadian_french:
+      status: revise
+      issues:
+      - '400 Client Error: Bad Request for url: https://api.gmi-serving.com/v1/chat/completions'
+      suggested_edits: ''
+      notes: Locale grammar reviewer call failed.
+  listing_reference_audit: null
+  user_copy_instructions: ''
+  user_image_instructions: ''

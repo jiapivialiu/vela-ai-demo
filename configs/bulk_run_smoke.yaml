@@ -1,0 +1,38 @@
+# bulk_run_smoke.yaml — mock smoke (limit 3, no harmonize / no extra images). Contrast: bulk_run.yaml. Runbook: src/README.md.
+
+run_name: mtwi_bulk_smoke
+output_root: outputs/runs
+
+pipeline:
+  txt_dir: data/mtwi_train/txt_train
+  image_dir: data/mtwi_train/image_train
+  input_images_glob: "*.jpg*"
+  limit: 3
+
+  mask_mode: overlay
+  erase_strategy: local
+  quality_strategy: local
+  disable_erase: false
+  disable_restore: true
+  no_mask: false
+  harmonize_after_erase: false
+  mock: true
+
+  vision_model: Qwen/Qwen3-VL-235B
+  copy_generation_mode: unified
+  unified_copy_model: openai/gpt-5.4-pro
+  english_copy_model: openai/gpt-5.4-pro
+  french_copy_model: anthropic/claude-sonnet-4.6
+  fallback_english_copy_model: openai/gpt-5.4-mini
+  fallback_french_copy_model: openai/gpt-5.4-mini
+  copy_review_english_model: openai/gpt-5.4
+  copy_review_french_model: anthropic/claude-sonnet-4.6
+  locale_grammar_english_model: openai/gpt-5.4-nano
+  locale_grammar_french_model: openai/gpt-5.4-nano
+  skip_listing_review: false
+  generate_additional_images: false
+  max_attempts: 2
+  stability_update_every: 1
+
+evaluation:
+  diff_threshold: 12

@@ -1,0 +1,52 @@
+# bulk_run.yaml — production-oriented batch template (real APIs, default limit 200).
+# Smoke / CI: bulk_run_smoke.yaml. Runbook: src/README.md.
+# Optional top-level env map merged into process env, e.g. env: { GMI_API_KEY: "..." }
+
+run_name: mtwi_bulk
+output_root: outputs/runs
+
+pipeline:
+  txt_dir: data/mtwi_train/txt_train
+  image_dir: data/mtwi_train/image_train
+  input_images_glob: "*.jpg*"
+  limit: 200
+
+  mask_mode: overlay
+  erase_strategy: model
+  quality_strategy: local
+  disable_erase: false
+  disable_restore: true
+  no_mask: false
+  harmonize_after_erase: true
+  harmonize_model: bria-fibo-edit
+  mock: false
+
+  vision_model: Qwen/Qwen3-VL-235B
+  copy_understand_image: final
+  copy_generation_mode: unified
+  unified_copy_model: openai/gpt-5.4-pro
+  english_copy_model: openai/gpt-5.4-pro
+  french_copy_model: anthropic/claude-sonnet-4.6
+  fallback_english_copy_model: openai/gpt-5.4-mini
+  fallback_french_copy_model: openai/gpt-5.4-mini
+  copy_review_english_model: openai/gpt-5.4
+  copy_review_french_model: anthropic/claude-sonnet-4.6
+  locale_grammar_english_model: openai/gpt-5.4-nano
+  locale_grammar_french_model: openai/gpt-5.4-nano
+  # Skip Step4b/4c (faster; deliverables omit copy_review / locale_grammar markdown)
+  skip_listing_review: false
+  generate_additional_images: true
+  additional_image_model: seedream-5.0-lite
+  additional_image_count: 3
+  max_attempts: 2
+  stability_update_every: 100
+
+  # Optional: operator style (same for every item in this batch). Multiline YAML supported.
+  # user_copy_instructions: |
+  #   Tone: professional. Mention free shipping in description only if true.
+  # user_image_instructions: "Clean white studio background, soft daylight."
+  # user_copy_instructions_file: path/to/copy_notes.txt
+  # user_image_instructions_file: path/to/image_notes.txt
+
+evaluation:
+  diff_threshold: 12
