@@ -10,3 +10,6 @@ credentials.json
 
 # macOS metadata
 .DS_Store
+
+# Large datasets – never commit raw images to git
+data/mtwi/
