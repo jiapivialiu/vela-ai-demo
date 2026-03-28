@@ -1,7 +1,8 @@
 """Reproducible bulk runner: pipeline → deliverables → image + copy eval → stability reports.
 
+Targets GMI Cloud Inference Engine (same defaults as mtwi_ecommerce_pipeline.parse_args).
 Config keys mirror CLI flags (see configs/bulk_run.yaml). Omitted keys use defaults in
-`build_pipeline_cmd` (e.g. eraser/restore model IDs only matter for model erase/restore).
+`build_pipeline_cmd`. Model/env overview: ../agent.md and ../CONFIGURATION.md.
 Operator docs: src/README.md (bulk section).
 
 Usage:
@@ -66,11 +67,23 @@ def build_pipeline_cmd(cfg: Dict[str, Any], run_dir: Path) -> List[str]:
         "--restore-model",
         str(pipeline_cfg.get("restore_model", "bria-fibo-restore")),
         "--vision-model",
-        str(pipeline_cfg.get("vision_model", "openai/gpt-4o")),
-        "--qwen-model",
-        str(pipeline_cfg.get("qwen_model", "Qwen/Qwen3.5-27B")),
-        "--fallback-text-model",
-        str(pipeline_cfg.get("fallback_text_model", "openai/gpt-4o-mini")),
+        str(pipeline_cfg.get("vision_model", "Qwen/Qwen3-VL-235B")),
+        "--english-copy-model",
+        str(pipeline_cfg.get("english_copy_model", "openai/gpt-5.4-pro")),
+        "--french-copy-model",
+        str(pipeline_cfg.get("french_copy_model", "anthropic/claude-sonnet-4.6")),
+        "--fallback-english-copy-model",
+        str(pipeline_cfg.get("fallback_english_copy_model", "openai/gpt-5.4-mini")),
+        "--fallback-french-copy-model",
+        str(pipeline_cfg.get("fallback_french_copy_model", "openai/gpt-5.4-mini")),
+        "--copy-review-english-model",
+        str(pipeline_cfg.get("copy_review_english_model", "openai/gpt-5.4")),
+        "--copy-review-french-model",
+        str(pipeline_cfg.get("copy_review_french_model", "anthropic/claude-sonnet-4.6")),
+        "--locale-grammar-english-model",
+        str(pipeline_cfg.get("locale_grammar_english_model", "openai/gpt-5.4-nano")),
+        "--locale-grammar-french-model",
+        str(pipeline_cfg.get("locale_grammar_french_model", "openai/gpt-5.4-nano")),
         "--max-attempts",
         str(int(pipeline_cfg.get("max_attempts", 2))),
         "--stability-update-every",
@@ -111,6 +124,18 @@ def build_pipeline_cmd(cfg: Dict[str, Any], run_dir: Path) -> List[str]:
         cmd.append("--mock")
     if pipeline_cfg.get("input_images_glob"):
         cmd.extend(["--input-images-glob", str(pipeline_cfg["input_images_glob"])])
+    uc = pipeline_cfg.get("user_copy_instructions")
+    if uc is not None and str(uc).strip():
+        cmd.extend(["--user-copy-instructions", str(uc)])
+    ucf = pipeline_cfg.get("user_copy_instructions_file")
+    if ucf:
+        cmd.extend(["--user-copy-instructions-file", str(ucf)])
+    ui = pipeline_cfg.get("user_image_instructions")
+    if ui is not None and str(ui).strip():
+        cmd.extend(["--user-image-instructions", str(ui)])
+    uif = pipeline_cfg.get("user_image_instructions_file")
+    if uif:
+        cmd.extend(["--user-image-instructions-file", str(uif)])
     return cmd
 
 

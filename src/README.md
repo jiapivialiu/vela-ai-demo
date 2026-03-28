@@ -1,6 +1,6 @@
 # MTWI 训练与批处理链路
 
-本目录为 **命令行 pipeline**、**批量可复现运行**与**质量评估**；与根目录 **Streamlit 试用页**（见仓库 [README.md](../README.md)）共用同一套 `mtwi_ecommerce_pipeline` 逻辑。
+本目录为 **命令行 pipeline**、**批量可复现运行**与**质量评估**；与根目录 **Streamlit 试用页**（见 [README.md](../README.md)，配置细节见 [CONFIGURATION.md](../CONFIGURATION.md)）共用同一套 `mtwi_ecommerce_pipeline` 逻辑。推理底座为 **GMI Cloud Inference Engine**；**默认模型、Agent 步骤与 Chat/图像队列分工** 见 [agent.md](../agent.md)。
 
 ## 仓库地图
 
@@ -46,11 +46,36 @@ python src/mtwi_ecommerce_pipeline.py --limit 3 \
   --erase-strategy local --quality-strategy local \
   --no-harmonize-after-erase --disable-restore \
   --mask-mode overlay --generate-additional-images --additional-image-count 3 \
-  --vision-model "openai/gpt-4o" --qwen-model "Qwen/Qwen3.5-27B" \
-  --fallback-text-model "openai/gpt-4o-mini" \
+  --vision-model "Qwen/Qwen3-VL-235B" \
+  --english-copy-model "openai/gpt-5.4-pro" \
+  --french-copy-model "anthropic/claude-sonnet-4.6" \
+  --fallback-english-copy-model "openai/gpt-5.4-mini" \
+  --fallback-french-copy-model "openai/gpt-5.4-mini" \
+  --copy-review-english-model "openai/gpt-5.4" \
+  --copy-review-french-model "anthropic/claude-sonnet-4.6" \
+  --locale-grammar-english-model "openai/gpt-5.4-nano" \
+  --locale-grammar-french-model "openai/gpt-5.4-nano" \
   --image-output-dir outputs/mtwi_images \
   --export-deliverables --deliverable-dir outputs/deliverables
 ```
+
+步骤 **4b**（英文 + 法文各一次视觉 JSON 质检）与 **4c**（英文 + 法文各一次语法 JSON 质检）**默认始终执行**；可用上列 `--*-model` 与对应 `GMI_*` 环境变量覆盖模型 ID（须与账户内可用名称一致）。
+
+### 操作者定制（单条与批量通用）
+
+对**整次运行**生效（批量时每个 SKU 使用同一套说明）：
+
+| 方式 | 说明 |
+|------|------|
+| `--user-copy-instructions "..."` | 文案：语气、长度、SEO、受众等；写入 step4，并传给文案质检 |
+| `--user-copy-instructions-file path.txt` | 若文件存在，**替换**内联文案说明（UTF-8） |
+| `--user-image-instructions "..."` | 图像：背景、光线、影调；用于模型去字、harmonize、restore、扩展图 prompt |
+| `--user-image-instructions-file path.txt` | 若文件存在，**替换**内联图像说明 |
+| 环境变量 | `GMI_USER_COPY_INSTRUCTIONS` / `GMI_USER_IMAGE_INSTRUCTIONS` 会**追加**到上述解析结果之后（长度仍受截断保护） |
+
+产物中 `manifest.json` / YAML 会记录 `user_copy_instructions` 与 `user_image_instructions` 字段便于审计。
+
+批量可在 `configs/bulk_run.yaml` 的 `pipeline` 下配置 `user_copy_instructions`（多行 YAML）、`user_image_instructions` 或对应 `*_file` 键。
 
 ## 批量可复现
 
@@ -70,7 +95,9 @@ python src/run_bulk_pipeline.py --config configs/bulk_run.yaml
 ## 输出提要
 
 - **聚合 YAML**：单次默认 `outputs/mtwi_ecommerce_samples.yaml`；批量在对应 `run_id` 目录下。
-- **交付包**：每商品子目录含 `product_image.png`、`description_en.md`、`description_fr.md`、`manifest.json`，可选 `product_image_extra_*.png`；根目录 `deliverables_index.csv`。
+- **交付包**：每商品子目录含 `product_image.png`、`description_en.md`、`description_fr.md`、`manifest.json`，可选 `product_image_extra_*.png`；根目录 `deliverables_index.csv` 含 `copy_review_md`、`locale_grammar_md`。
+- **文案 LLM 质检（必选，4b）**：英文 `--copy-review-english-model`（默认 `openai/gpt-5.4`）、法文 `--copy-review-french-model`（默认 `anthropic/claude-sonnet-4.6`）；各一次视觉 + JSON，结果合并进 `manifest.json` 的 `copy_review` 与 **`copy_review.md`**。稳定性：`step4b_copy_review_failed`、`copy_review_fail`、`copy_review_revise`。
+- **加拿大英语 + 加拿大法语语法质检（必选，4c）**：`--locale-grammar-english-model` / `--locale-grammar-french-model`（默认均为 `openai/gpt-5.4-nano`）。`locale_grammar_review`、**`locale_grammar_review.md`**、索引列 `locale_grammar_md`。稳定性：`step4c_locale_grammar_failed`、`locale_grammar_fail`、`locale_grammar_revise`。
 
 ## 单独跑评估
 
@@ -98,6 +125,6 @@ python src/eval_copy_quality.py \
 | 方式 | 适用 | 注意 |
 |------|------|------|
 | 发仓库 + 根 **[README.md](../README.md)** | 对方本机跑 Streamlit | 对方自备 Key 或使用 Mock |
-| 局域网 | 同 WiFi | `streamlit run streamlit_app.py --server.address 0.0.0.0` |
+| 局域网 | 同 WiFi | 见 **[CONFIGURATION.md](../CONFIGURATION.md)** |
 | 临时公网 | 远程演示 | ngrok / Cloudflare Tunnel 等，用完即关 |
 | Streamlit Cloud | 长期托管 | 平台 Secrets 配置 `GMI_API_KEY`，仓库不含密钥 |

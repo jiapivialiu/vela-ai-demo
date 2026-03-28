@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Single-product deliverable demo (data/demo_one/). Full context: src/README.md.
-# Flow: local erase + local quality + EN/FR copy + 3 extra images + outputs under outputs/deliverables_demo_one/.
+# Single-product deliverable demo (data/demo_one/). Context: src/README.md, agent.md.
+# Flow: GMI pipeline — local erase/quality + VLM + split EN/FR copy + mandatory 4b/4c reviews + 3 extra images → outputs/deliverables_demo_one/.
 # Requires: .venv, pip install -r requirements.txt, GMI_API_KEY (or credentials.json for this script only).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -19,9 +19,15 @@ exec .venv/bin/python src/mtwi_ecommerce_pipeline.py \
   --quality-strategy local \
   --no-harmonize-after-erase \
   --mask-mode all \
-  --vision-model "openai/gpt-4o" \
-  --qwen-model "Qwen/Qwen3.5-27B" \
-  --fallback-text-model "openai/gpt-4o-mini" \
+  --vision-model "Qwen/Qwen3-VL-235B" \
+  --english-copy-model "openai/gpt-5.4-pro" \
+  --french-copy-model "anthropic/claude-sonnet-4.6" \
+  --fallback-english-copy-model "openai/gpt-5.4-mini" \
+  --fallback-french-copy-model "openai/gpt-5.4-mini" \
+  --copy-review-english-model "openai/gpt-5.4" \
+  --copy-review-french-model "anthropic/claude-sonnet-4.6" \
+  --locale-grammar-english-model "openai/gpt-5.4-nano" \
+  --locale-grammar-french-model "openai/gpt-5.4-nano" \
   --generate-additional-images \
   --additional-image-model "${GMI_ADDITIONAL_IMAGE_MODEL:-seedream-5.0-lite}" \
   --additional-image-count 3 \

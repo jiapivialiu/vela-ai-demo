@@ -21,14 +21,27 @@ pipeline:
   harmonize_model: bria-fibo-edit
   mock: false
 
-  vision_model: openai/gpt-4o
-  qwen_model: Qwen/Qwen3.5-27B
-  fallback_text_model: openai/gpt-4o-mini
+  vision_model: Qwen/Qwen3-VL-235B
+  english_copy_model: openai/gpt-5.4-pro
+  french_copy_model: anthropic/claude-sonnet-4.6
+  fallback_english_copy_model: openai/gpt-5.4-mini
+  fallback_french_copy_model: openai/gpt-5.4-mini
+  copy_review_english_model: openai/gpt-5.4
+  copy_review_french_model: anthropic/claude-sonnet-4.6
+  locale_grammar_english_model: openai/gpt-5.4-nano
+  locale_grammar_french_model: openai/gpt-5.4-nano
   generate_additional_images: true
   additional_image_model: seedream-5.0-lite
   additional_image_count: 3
   max_attempts: 2
   stability_update_every: 100
+
+  # Optional: operator style (same for every item in this batch). Multiline YAML supported.
+  # user_copy_instructions: |
+  #   Tone: professional. Mention free shipping in description only if true.
+  # user_image_instructions: "Clean white studio background, soft daylight."
+  # user_copy_instructions_file: path/to/copy_notes.txt
+  # user_image_instructions_file: path/to/image_notes.txt
 
 evaluation:
   diff_threshold: 12

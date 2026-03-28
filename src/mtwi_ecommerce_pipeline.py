@@ -1,10 +1,11 @@
-"""MTWI → ecommerce pipeline (see agent.md for architecture, src/README.md for runbook).
+"""MTWI → ecommerce pipeline (GMI Cloud Inference Engine).
 
-Steps: text removal (local and/or model) → optional harmonize → quality (local and/or model) →
-vision understanding → bilingual copy → optional extra same-product images.
+Flow: text removal (local and/or Request Queue) → optional harmonize → quality (local and/or model) →
+vision (default Qwen/Qwen3-VL-235B) → EN/FR copy (default gpt-5.4-pro / claude-sonnet-4.6) →
+mandatory bilingual vision copy review + mandatory locale grammar review → optional extra images.
 
-Do not duplicate long usage blocks here; run `python src/mtwi_ecommerce_pipeline.py --help`
-or `./scripts/run_one_deliverable_example.sh` (see src/README.md).
+See agent.md for model table and per-SKU chat call counts; src/README.md for CLI/bulk; CONFIGURATION.md for GMI_* env vars.
+Run: `python src/mtwi_ecommerce_pipeline.py --help` or `scripts/run_one_deliverable_example.sh`.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
 
 import requests
 
@@ -60,6 +61,10 @@ class EcommerceArtifact:
     warnings: List[str]
     erased_spans: Optional[List[Dict[str, Any]]] = None
     additional_generated_images: Optional[List[str]] = None
+    copy_review: Optional[Dict[str, Any]] = None
+    locale_grammar_review: Optional[Dict[str, Any]] = None
+    user_copy_instructions: str = ""
+    user_image_instructions: str = ""
 
 
 class RequestQueueClient:
@@ -233,6 +238,26 @@ class ChatClient:
             raise last_exc
         content = resp.json()["choices"][0]["message"]["content"]
         return parse_json_content(content)
+
+
+def resolve_operator_instructions(
+    inline: str,
+    file_path: Optional[str],
+    max_chars: int,
+    warnings: Optional[List[str]] = None,
+) -> str:
+    """Resolve user-facing instructions: optional file overrides inline when file exists."""
+    inline = (inline or "").strip()
+    chosen = inline
+    if file_path and str(file_path).strip():
+        p = Path(file_path).expanduser()
+        if p.is_file():
+            chosen = p.read_text(encoding="utf-8").strip()
+        elif warnings is not None:
+            warnings.append(f"user_instructions_file_missing: {p}")
+    if len(chosen) > max_chars:
+        chosen = chosen[:max_chars] + "\n...[truncated by pipeline]"
+    return chosen
 
 
 def parse_annotation_file(path: Path) -> List[OCRTextSpan]:
@@ -420,6 +445,7 @@ def run_step1_text_erase(
     out_dir: Path,
     eraser_model: str,
     use_mask: bool,
+    user_image_instructions: str = "",
 ) -> Optional[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     mask_path = out_dir / f"{product_id}_mask.png"
@@ -432,6 +458,11 @@ def run_step1_text_erase(
         "Preserve camera view, lighting, and background perspective. Photorealistic result.\n"
         "Output must contain no visible text and no watermark."
     )
+    if user_image_instructions.strip():
+        edit_prompt += (
+            "\n\nOperator image preferences (must not override identity-preservation rules above):\n"
+            + user_image_instructions.strip()
+        )
     result_bytes = rq.run_image_edit(
         model=eraser_model,
         source_image=source_image,
@@ -543,6 +574,7 @@ def run_step2_restore(
     product_id: str,
     out_dir: Path,
     restore_model: str,
+    user_image_instructions: str = "",
 ) -> Optional[Path]:
     restore_prompt = (
         "TASK: Quality enhancement only for ecommerce.\n"
@@ -550,6 +582,11 @@ def run_step2_restore(
         "Do NOT change product geometry, material, color, count, branding, or packaging.\n"
         "Do NOT add any new objects or text. Photorealistic only."
     )
+    if user_image_instructions.strip():
+        restore_prompt += (
+            "\n\nOperator preferences for overall look (lighting, color mood, background feel; no new objects):\n"
+            + user_image_instructions.strip()
+        )
     result_bytes = rq.run_image_edit(
         model=restore_model,
         source_image=erased_image,
@@ -569,6 +606,7 @@ def run_step2_harmonize_model(
     product_id: str,
     out_dir: Path,
     harmonize_model: str,
+    user_image_instructions: str = "",
 ) -> Optional[Path]:
     """Model-based naturalization pass after deterministic text removal."""
     prompt = (
@@ -577,6 +615,8 @@ def run_step2_harmonize_model(
         "Keep the exact same product, geometry, material, color, and composition. "
         "Do not add text, logos, new objects, or redesign."
     )
+    if user_image_instructions.strip():
+        prompt += " Operator preferences (subtle adjustments only, same product): " + user_image_instructions.strip()
     result_bytes = rq.run_image_edit(
         model=harmonize_model,
         source_image=erased_image,
@@ -598,6 +638,7 @@ def generate_additional_product_images(
     model: str,
     count: int,
     structured_attributes: Optional[Dict[str, Any]] = None,
+    user_image_instructions: str = "",
 ) -> List[str]:
     """Generate additional images of the same product from repaired image.
 
@@ -624,6 +665,11 @@ def generate_additional_product_images(
         base += f" Product type: {product_type}."
     if feature_text:
         base += f" Product cues: {feature_text}."
+    if user_image_instructions.strip():
+        base += (
+            " Operator style requirements for shots (background, lighting, mood; keep same product identity): "
+            + user_image_instructions.strip()
+        )
 
     scenario_prompts = [
         base + " Shot type: alternate angle (3/4 view), clean studio background.",
@@ -736,32 +782,47 @@ Return JSON only with keys:
     return chat.chat_json(model=model, messages=messages, max_tokens=900, temperature=0.1)
 
 
-def run_step4_generate_copy(
+def _step4_operator_block(user_copy_instructions: str) -> str:
+    if not user_copy_instructions.strip():
+        return ""
+    return f"""
+Operator requirements for tone, audience, bullets, length, SEO keywords, or brand voice (apply only when compatible with facts; do not invent product claims; output text must match the requested language only, with no Chinese):
+{user_copy_instructions.strip()}
+"""
+
+
+def run_step4_generate_copy_language(
     chat: ChatClient,
     model: str,
     structured_attributes: Dict[str, Any],
     extracted_text: List[str],
-) -> Tuple[LocalizedListing, LocalizedListing]:
+    user_copy_instructions: str,
+    target: Literal["canadian_english", "canadian_french"],
+) -> LocalizedListing:
+    """Generate one locale listing (Canadian English or Canadian French) with a dedicated model."""
+    lang_name = "Canadian English" if target == "canadian_english" else "Canadian French (français canadien)"
+    listing_key = target
     if chat.mock:
-        en = LocalizedListing(
-            title="Mock: Product title in Canadian English",
-            description="Mock: Product description in Canadian English based on structured attributes.",
-            category="Mock: Category > Subcategory",
-            key_attributes={"feature_1": "mock"},
-        )
-        fr = LocalizedListing(
+        if target == "canadian_english":
+            return LocalizedListing(
+                title="Mock: Product title in Canadian English",
+                description="Mock: Product description in Canadian English based on structured attributes.",
+                category="Mock: Category > Subcategory",
+                key_attributes={"feature_1": "mock"},
+            )
+        return LocalizedListing(
             title="Maquette : Titre produit en francais canadien",
             description="Maquette : Description produit en francais canadien selon les attributs structures.",
             category="Maquette : Categorie > Sous-categorie",
             key_attributes={"caracteristique_1": "maquette"},
         )
-        return en, fr
 
     attrs_text = json.dumps(structured_attributes, ensure_ascii=False, indent=2)
     ocr_text = "\n".join(f"- {t}" for t in extracted_text[:20])
+    operator_block = _step4_operator_block(user_copy_instructions)
     prompt = f"""
 You are an ecommerce localization copywriter for Canada.
-Source language: Chinese. Output languages: Canadian English and Canadian French.
+Source language: Chinese. Target output language: {lang_name} only.
 
 Inputs:
 Structured attributes:
@@ -769,26 +830,19 @@ Structured attributes:
 
 OCR text clues:
 {ocr_text}
-
-Output JSON only:
+{operator_block}
+Output JSON only with a single top-level key "{listing_key}":
 {{
-  "canadian_english": {{
-    "title": "string, English only",
-    "description": "string, English only",
-    "category": "string, English only category path",
-    "key_attributes": {{"key":"value"}}
-  }},
-  "canadian_french": {{
-    "title": "string, French only",
-    "description": "string, French only",
-    "category": "string, French only category path",
+  "{listing_key}": {{
+    "title": "string",
+    "description": "string",
+    "category": "string category path",
     "key_attributes": {{"key":"value"}}
   }}
 }}
 
 Rules:
-- English block must be English-only.
-- French block must be French-only.
+- All string values in that object must be in the target language only ({lang_name}).
 - Do not include ANY Chinese characters in output text fields (including brand names).
   If the input contains Chinese brand/series, romanize it (pinyin) or omit it.
 - Do not include URLs, seller claims, or watermark-related phrases.
@@ -797,15 +851,460 @@ Rules:
     data = chat.chat_json(
         model=model,
         messages=[
-            {"role": "system", "content": "You generate factual bilingual ecommerce copy as strict JSON."},
+            {
+                "role": "system",
+                "content": f"You generate factual {lang_name} ecommerce copy as strict JSON only.",
+            },
             {"role": "user", "content": prompt},
         ],
-        max_tokens=1200,
+        max_tokens=900,
         temperature=0.3,
     )
-    en = build_listing(data, "canadian_english", "English")
-    fr = build_listing(data, "canadian_french", "French")
-    return en, fr
+    label = "English" if target == "canadian_english" else "French"
+    return build_listing(data if isinstance(data, dict) else {}, listing_key, label)
+
+
+def _normalize_copy_review(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure expected keys exist for downstream YAML / UI."""
+    status = str(raw.get("overall_status", "")).strip().lower()
+    if status not in {"pass", "revise", "fail"}:
+        status = "revise" if raw else "pass"
+    out: Dict[str, Any] = {
+        "overall_status": status,
+        "summary": str(raw.get("summary", "")).strip() or "No summary returned.",
+        "exaggeration_findings": _as_str_list(raw.get("exaggeration_findings")),
+        "attribute_conflicts": _as_str_list(raw.get("attribute_conflicts")),
+        "image_visual_mismatches": _as_str_list(raw.get("image_visual_mismatches")),
+        "en_revision_suggestions": str(raw.get("en_revision_suggestions", "")).strip(),
+        "fr_revision_suggestions": str(raw.get("fr_revision_suggestions", "")).strip(),
+        "scores": {},
+    }
+    scores = raw.get("scores")
+    if isinstance(scores, dict):
+        for k in ("grounding", "factual_tone"):
+            v = scores.get(k)
+            if isinstance(v, (int, float)):
+                out["scores"][k] = float(max(0.0, min(1.0, float(v))))
+    return out
+
+
+def _as_str_list(val: Any) -> List[str]:
+    if val is None:
+        return []
+    if isinstance(val, list):
+        return [str(x).strip() for x in val if str(x).strip()]
+    if isinstance(val, str) and val.strip():
+        return [val.strip()]
+    return []
+
+
+def format_copy_review_markdown(review: Dict[str, Any]) -> str:
+    lines = [
+        "# Copy quality review",
+        "",
+        f"**Status**: `{review.get('overall_status', '')}`",
+        f"**Summary**: {review.get('summary', '')}",
+        "",
+        "## Scores",
+    ]
+    scores = review.get("scores") or {}
+    if isinstance(scores, dict) and scores:
+        for k, v in scores.items():
+            lines.append(f"- **{k}**: {v}")
+    else:
+        lines.append("- _(none)_")
+    lines.extend(["", "## Exaggeration / hype findings", ""])
+    for item in review.get("exaggeration_findings") or []:
+        lines.append(f"- {item}")
+    if not review.get("exaggeration_findings"):
+        lines.append("- _(none)_")
+    lines.extend(["", "## Conflicts with structured attributes", ""])
+    for item in review.get("attribute_conflicts") or []:
+        lines.append(f"- {item}")
+    if not review.get("attribute_conflicts"):
+        lines.append("- _(none)_")
+    lines.extend(["", "## Image / visual mismatches", ""])
+    for item in review.get("image_visual_mismatches") or []:
+        lines.append(f"- {item}")
+    if not review.get("image_visual_mismatches"):
+        lines.append("- _(none)_")
+    lines.extend(
+        [
+            "",
+            "## Suggested fixes (EN)",
+            "",
+            review.get("en_revision_suggestions") or "_(none)_",
+            "",
+            "## Suggested fixes (FR)",
+            "",
+            review.get("fr_revision_suggestions") or "_(none)_",
+            "",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _merge_copy_reviews_bilingual(en_rev: Dict[str, Any], fr_rev: Dict[str, Any]) -> Dict[str, Any]:
+    """Combine English-only and French-only vision audits into one manifest-friendly object."""
+    a = _normalize_copy_review(en_rev)
+    b = _normalize_copy_review(fr_rev)
+
+    def _rank(st: str) -> int:
+        s = str(st).lower()
+        return {"fail": 2, "revise": 1, "pass": 0}.get(s, 1)
+
+    ra, rb = _rank(a["overall_status"]), _rank(b["overall_status"])
+    overall = "fail" if max(ra, rb) == 2 else ("revise" if max(ra, rb) == 1 else "pass")
+
+    def _merge_lists(x: List[str], y: List[str]) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        for item in x + y:
+            s = str(item).strip()
+            if s and s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+
+    sa = str(a.get("summary", "")).strip()
+    sb = str(b.get("summary", "")).strip()
+    _parts: List[str] = []
+    if sa:
+        _parts.append(f"EN: {sa}")
+    if sb:
+        _parts.append(f"FR: {sb}")
+    summary = " | ".join(_parts) if _parts else "Combined EN+FR copy review."
+
+    scores_a = a.get("scores") if isinstance(a.get("scores"), dict) else {}
+    scores_b = b.get("scores") if isinstance(b.get("scores"), dict) else {}
+    g = min(
+        float(scores_a.get("grounding", 0.5)) if scores_a else 0.5,
+        float(scores_b.get("grounding", 0.5)) if scores_b else 0.5,
+    )
+    f = min(
+        float(scores_a.get("factual_tone", 0.5)) if scores_a else 0.5,
+        float(scores_b.get("factual_tone", 0.5)) if scores_b else 0.5,
+    )
+
+    return _normalize_copy_review(
+        {
+            "overall_status": overall,
+            "summary": summary or "Combined EN+FR copy review.",
+            "exaggeration_findings": _merge_lists(
+                _as_str_list(a.get("exaggeration_findings")),
+                _as_str_list(b.get("exaggeration_findings")),
+            ),
+            "attribute_conflicts": _merge_lists(
+                _as_str_list(a.get("attribute_conflicts")),
+                _as_str_list(b.get("attribute_conflicts")),
+            ),
+            "image_visual_mismatches": _merge_lists(
+                _as_str_list(a.get("image_visual_mismatches")),
+                _as_str_list(b.get("image_visual_mismatches")),
+            ),
+            "en_revision_suggestions": str(a.get("en_revision_suggestions", "")).strip(),
+            "fr_revision_suggestions": str(b.get("fr_revision_suggestions", "")).strip(),
+            "scores": {"grounding": g, "factual_tone": f},
+        }
+    )
+
+
+def _run_step4b_review_copy_one_language(
+    chat: ChatClient,
+    model: str,
+    product_id: str,
+    source_image: Path,
+    structured_attributes: Dict[str, Any],
+    listing: LocalizedListing,
+    language_name: str,
+    audit_english: bool,
+    user_copy_instructions: str,
+) -> Dict[str, Any]:
+    """Vision audit for a single locale; returns full-schema dict (other language suggestions empty)."""
+    attrs_text = json.dumps(structured_attributes, ensure_ascii=False, indent=2)
+    listing_text = json.dumps(
+        {"canadian_english" if audit_english else "canadian_french": asdict(listing)},
+        ensure_ascii=False,
+        indent=2,
+    )
+    prompt = f"""
+You are a quality reviewer for Canadian ecommerce listings.
+product_id: {product_id}
+
+Focus: audit ONLY the {language_name} listing below (not the other language).
+You see the ORIGINAL listing image. Structured attributes were inferred from image + OCR (may be incomplete).
+
+Structured attributes:
+{attrs_text}
+
+Generated listing ({language_name} only):
+{listing_text}
+"""
+    if user_copy_instructions.strip():
+        prompt += f"""
+
+Operator copy/style requirements the listing was asked to follow (check whether the text satisfies these without inventing facts against the image):
+{user_copy_instructions.strip()}
+"""
+    prompt += """
+
+Return JSON only with keys:
+- overall_status: one of "pass", "revise", "fail" for THIS language listing vs image + attributes
+- summary: one short sentence for operators (English is OK)
+- exaggeration_findings: string[]
+- attribute_conflicts: string[]
+- image_visual_mismatches: string[]
+- en_revision_suggestions: string — bullet-style fixes for English (empty if this audit is not English)
+- fr_revision_suggestions: string — bullet-style fixes for French (empty if this audit is not French)
+- scores: object with "grounding" and "factual_tone" each 0.0-1.0
+
+Rules:
+- If structured confidence is "low", flag only clear inventions.
+- Do not output Chinese characters.
+- For the language you are NOT auditing, set that language's *_revision_suggestions to an empty string.
+""".strip()
+    messages = [
+        {
+            "role": "system",
+            "content": "You audit ecommerce copy for factual grounding vs image and structured attributes. Output strict JSON only.",
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": path_to_data_url(source_image)}},
+            ],
+        },
+    ]
+    raw = chat.chat_json(model=model, messages=messages, max_tokens=1000, temperature=0.1)
+    if not raw:
+        return _normalize_copy_review(
+            {
+                "overall_status": "revise",
+                "summary": f"{language_name} copy review returned empty JSON.",
+                "exaggeration_findings": [],
+                "attribute_conflicts": [],
+                "image_visual_mismatches": [],
+                "en_revision_suggestions": "" if not audit_english else "",
+                "fr_revision_suggestions": "" if audit_english else "",
+                "scores": {},
+            }
+        )
+    return _normalize_copy_review(raw if isinstance(raw, dict) else {})
+
+
+def run_step4b_review_copy_bilingual(
+    chat: ChatClient,
+    model_english: str,
+    model_french: str,
+    product_id: str,
+    source_image: Path,
+    structured_attributes: Dict[str, Any],
+    en: LocalizedListing,
+    fr: LocalizedListing,
+    user_copy_instructions: str = "",
+) -> Tuple[Dict[str, Any], bool]:
+    """Two vision JSON calls (EN + FR reviewers); returns (merged_review, any_side_failed)."""
+    if chat.mock:
+        return (
+            _normalize_copy_review(
+                {
+                    "overall_status": "pass",
+                    "summary": "Mock mode: copy review placeholder pass (EN+FR).",
+                    "exaggeration_findings": [],
+                    "attribute_conflicts": [],
+                    "image_visual_mismatches": [],
+                    "en_revision_suggestions": "",
+                    "fr_revision_suggestions": "",
+                    "scores": {"grounding": 1.0, "factual_tone": 1.0},
+                }
+            ),
+            False,
+        )
+
+    failed = False
+    try:
+        en_raw = _run_step4b_review_copy_one_language(
+            chat,
+            model_english,
+            product_id,
+            source_image,
+            structured_attributes,
+            en,
+            "Canadian English",
+            audit_english=True,
+            user_copy_instructions=user_copy_instructions,
+        )
+    except Exception:
+        failed = True
+        en_raw = _normalize_copy_review(
+            {
+                "overall_status": "revise",
+                "summary": "English copy reviewer call failed.",
+                "exaggeration_findings": [],
+                "attribute_conflicts": [],
+                "image_visual_mismatches": [],
+                "en_revision_suggestions": "",
+                "fr_revision_suggestions": "",
+                "scores": {},
+            }
+        )
+    try:
+        fr_raw = _run_step4b_review_copy_one_language(
+            chat,
+            model_french,
+            product_id,
+            source_image,
+            structured_attributes,
+            fr,
+            "Canadian French",
+            audit_english=False,
+            user_copy_instructions=user_copy_instructions,
+        )
+    except Exception:
+        failed = True
+        fr_raw = _normalize_copy_review(
+            {
+                "overall_status": "revise",
+                "summary": "French copy reviewer call failed.",
+                "exaggeration_findings": [],
+                "attribute_conflicts": [],
+                "image_visual_mismatches": [],
+                "en_revision_suggestions": "",
+                "fr_revision_suggestions": "",
+                "scores": {},
+            }
+        )
+    merged = _merge_copy_reviews_bilingual(en_raw, fr_raw)
+    return merged, failed
+
+
+def _normalize_locale_grammar_block(raw: Dict[str, Any]) -> Dict[str, Any]:
+    st = str(raw.get("status", "pass")).strip().lower()
+    if st not in {"pass", "revise", "fail"}:
+        st = "revise" if raw else "pass"
+    return {
+        "status": st,
+        "issues": _as_str_list(raw.get("issues")),
+        "suggested_edits": str(raw.get("suggested_edits", "")).strip(),
+        "notes": str(raw.get("notes", "")).strip(),
+    }
+
+
+def format_locale_grammar_markdown(review: Dict[str, Any]) -> str:
+    lines = ["# Canadian locale grammar review (EN + FR)", ""]
+    for key, title in (
+        ("canadian_english", "## Canadian English (en-CA)"),
+        ("canadian_french", "## Canadian French (français canadien)"),
+    ):
+        block = review.get(key) if isinstance(review, dict) else None
+        if not isinstance(block, dict):
+            block = {}
+        lines.append(title)
+        lines.append("")
+        lines.append(f"**Status**: `{block.get('status', '')}`")
+        lines.append("")
+        lines.append(block.get("notes") or "_(none)_")
+        lines.append("")
+        lines.append("### Issues")
+        issues = block.get("issues") or []
+        if issues:
+            for it in issues:
+                lines.append(f"- {it}")
+        else:
+            lines.append("- _(none)_")
+        lines.append("")
+        lines.append("### Suggested edits")
+        lines.append(block.get("suggested_edits") or "_(none)_")
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def run_step4c_locale_grammar_review(
+    chat: ChatClient,
+    model_english: str,
+    model_french: str,
+    en: LocalizedListing,
+    fr: LocalizedListing,
+) -> Dict[str, Any]:
+    """Two text-only reviewers: Canadian English and Canadian French grammar/conventions (separate models)."""
+    if chat.mock:
+        ok = _normalize_locale_grammar_block(
+            {"status": "pass", "issues": [], "suggested_edits": "", "notes": "Mock: skipped."}
+        )
+        return {"canadian_english": ok, "canadian_french": {**ok}}
+
+    en_json = json.dumps(asdict(en), ensure_ascii=False, indent=2)
+    en_prompt = f"""
+You are a Canadian English (en-CA) copy editor for ecommerce listings in Canada.
+
+Listing fields (JSON):
+{en_json}
+
+Task:
+- Fix nothing in place; only analyze.
+- Check grammar, spelling, punctuation, hyphenation, and Canadian English conventions (e.g. Canadian spelling where appropriate, consistent terminology).
+- Do not alter factual product claims; flag if a wording implies unproven facts.
+
+Return JSON only:
+{{
+  "status": "pass" | "revise" | "fail",
+  "issues": string[],
+  "suggested_edits": string (concise bullet-style corrections; empty if none),
+  "notes": string (one short summary for operators)
+}}
+Rules:
+- Output JSON keys in English.
+- issues entries should be short and specific (field + problem).
+""".strip()
+
+    en_raw = chat.chat_json(
+        model=model_english,
+        messages=[
+            {"role": "system", "content": "You are a Canadian English editor. Output strict JSON only."},
+            {"role": "user", "content": en_prompt},
+        ],
+        max_tokens=900,
+        temperature=0.1,
+    )
+    en_block = _normalize_locale_grammar_block(en_raw if isinstance(en_raw, dict) else {})
+
+    fr_json = json.dumps(asdict(fr), ensure_ascii=False, indent=2)
+    fr_prompt = f"""
+You are a Canadian French (français canadien) copy editor for ecommerce listings in Canada.
+
+Listing fields (JSON):
+{fr_json}
+
+Task:
+- Fix nothing in place; only analyze.
+- Check grammar, spelling, agreement, punctuation, and Canadian French usage where it differs from France French (e.g. vocabulary and register appropriate for Canadian market; avoid European-only terms when a common Canadian form exists).
+- Do not alter factual product claims.
+
+Return JSON only:
+{{
+  "status": "pass" | "revise" | "fail",
+  "issues": string[],
+  "suggested_edits": string (concise bullet-style corrections; empty if none),
+  "notes": string (one short summary for operators; French is OK in notes)
+}}
+Rules:
+- JSON keys must remain in English as shown.
+- issues can be written in French.
+""".strip()
+
+    fr_raw = chat.chat_json(
+        model=model_french,
+        messages=[
+            {"role": "system", "content": "You are a Canadian French editor. Output strict JSON only."},
+            {"role": "user", "content": fr_prompt},
+        ],
+        max_tokens=900,
+        temperature=0.1,
+    )
+    fr_block = _normalize_locale_grammar_block(fr_raw if isinstance(fr_raw, dict) else {})
+
+    return {"canadian_english": en_block, "canadian_french": fr_block}
 
 
 def parse_json_content(content: Any) -> Dict[str, Any]:
@@ -910,6 +1409,12 @@ def _build_stability_snapshot(
         "step4_copy_failed": int(stats.get("step4_copy_failed", 0)),
         "step4_copy_fallback_used": int(stats.get("step4_copy_fallback_used", 0)),
         "step4_copy_fallback_failed": int(stats.get("step4_copy_fallback_failed", 0)),
+        "step4b_copy_review_failed": int(stats.get("step4b_copy_review_failed", 0)),
+        "copy_review_fail": int(stats.get("copy_review_fail", 0)),
+        "copy_review_revise": int(stats.get("copy_review_revise", 0)),
+        "step4c_locale_grammar_failed": int(stats.get("step4c_locale_grammar_failed", 0)),
+        "locale_grammar_fail": int(stats.get("locale_grammar_fail", 0)),
+        "locale_grammar_revise": int(stats.get("locale_grammar_revise", 0)),
         "overlay_classifier_failed": int(stats.get("overlay_classifier_failed", 0)),
         "annotation_missing": int(stats.get("annotation_missing", 0)),
         "total_warning_events": int(stats.get("total_warning_events", 0)),
@@ -940,6 +1445,12 @@ def _write_stability_reports(snapshot: Dict[str, Any], json_path: Optional[Path]
             f"- Step4 copy failed: `{snapshot['step4_copy_failed']}`",
             f"- Step4 fallback used: `{snapshot['step4_copy_fallback_used']}`",
             f"- Step4 fallback failed: `{snapshot['step4_copy_fallback_failed']}`",
+            f"- Step4b copy review failed: `{snapshot['step4b_copy_review_failed']}`",
+            f"- Copy review status fail: `{snapshot['copy_review_fail']}`",
+            f"- Copy review status revise: `{snapshot['copy_review_revise']}`",
+            f"- Step4c locale grammar failed: `{snapshot['step4c_locale_grammar_failed']}`",
+            f"- Locale grammar fail (EN or FR): `{snapshot['locale_grammar_fail']}`",
+            f"- Locale grammar revise (EN or FR): `{snapshot['locale_grammar_revise']}`",
             f"- Overlay classifier failed: `{snapshot['overlay_classifier_failed']}`",
             f"- Annotation missing: `{snapshot['annotation_missing']}`",
             f"- Avg warning events per item: `{snapshot['avg_warning_events_per_item']}`",
@@ -1008,6 +1519,23 @@ def export_deliverables(artifacts: Sequence[EcommerceArtifact], deliverable_dir:
         en_path.write_text(en_text + "\n", encoding="utf-8")
         fr_path.write_text(fr_text + "\n", encoding="utf-8")
         manifest_path.write_text(json.dumps(asdict(artifact), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        review_md_path = product_dir / "copy_review.md"
+        review_md_str = ""
+        if artifact.copy_review:
+            review_md_path.write_text(
+                format_copy_review_markdown(artifact.copy_review),
+                encoding="utf-8",
+            )
+            review_md_str = str(review_md_path)
+
+        locale_md_path = product_dir / "locale_grammar_review.md"
+        locale_md_str = ""
+        if artifact.locale_grammar_review:
+            locale_md_path.write_text(
+                format_locale_grammar_markdown(artifact.locale_grammar_review),
+                encoding="utf-8",
+            )
+            locale_md_str = str(locale_md_path)
 
         index_rows.append(
             {
@@ -1017,6 +1545,8 @@ def export_deliverables(artifacts: Sequence[EcommerceArtifact], deliverable_dir:
                 "english_md": str(en_path),
                 "french_md": str(fr_path),
                 "manifest_json": str(manifest_path),
+                "copy_review_md": review_md_str,
+                "locale_grammar_md": locale_md_str,
                 "additional_images": " | ".join(additional_paths),
                 "warnings": " | ".join(artifact.warnings),
             }
@@ -1033,6 +1563,8 @@ def export_deliverables(artifacts: Sequence[EcommerceArtifact], deliverable_dir:
                 "english_md",
                 "french_md",
                 "manifest_json",
+                "copy_review_md",
+                "locale_grammar_md",
                 "additional_images",
                 "warnings",
             ],
@@ -1106,6 +1638,12 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         "overlay_classifier_failed": 0,
         "annotation_missing": 0,
         "total_warning_events": 0,
+        "step4b_copy_review_failed": 0,
+        "copy_review_fail": 0,
+        "copy_review_revise": 0,
+        "step4c_locale_grammar_failed": 0,
+        "locale_grammar_fail": 0,
+        "locale_grammar_revise": 0,
     }
     stability_json_path = Path(args.stability_report_path) if args.stability_report_path else None
     stability_md_path = Path(args.stability_markdown_path) if args.stability_markdown_path else None
@@ -1113,6 +1651,34 @@ def run_pipeline(args: argparse.Namespace) -> Path:
 
     work_img_dir = Path(args.image_output_dir)
     work_img_dir.mkdir(parents=True, exist_ok=True)
+
+    instr_warnings: List[str] = []
+    user_copy_resolved = resolve_operator_instructions(
+        getattr(args, "user_copy_instructions", "") or "",
+        getattr(args, "user_copy_instructions_file", None),
+        max_chars=4000,
+        warnings=instr_warnings,
+    )
+    env_copy = (os.getenv("GMI_USER_COPY_INSTRUCTIONS") or "").strip()
+    if env_copy:
+        user_copy_resolved = (
+            (user_copy_resolved + "\n\n" + env_copy).strip()[:4000] if user_copy_resolved else env_copy[:4000]
+        )
+
+    user_image_resolved = resolve_operator_instructions(
+        getattr(args, "user_image_instructions", "") or "",
+        getattr(args, "user_image_instructions_file", None),
+        max_chars=2500,
+        warnings=instr_warnings,
+    )
+    env_img = (os.getenv("GMI_USER_IMAGE_INSTRUCTIONS") or "").strip()
+    if env_img:
+        user_image_resolved = (
+            (user_image_resolved + "\n\n" + env_img).strip()[:2500] if user_image_resolved else env_img[:2500]
+        )
+
+    for w in instr_warnings:
+        print(w)
 
     artifacts: List[EcommerceArtifact] = []
     for product_id, source_image, ann in input_items:
@@ -1159,6 +1725,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                         out_dir=work_img_dir,
                         eraser_model=args.eraser_model,
                         use_mask=not bool(args.no_mask),
+                        user_image_instructions=user_image_resolved,
                     )
             except Exception as exc:
                 warnings.append(f"step1_erase_failed: {exc}")
@@ -1175,6 +1742,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                     product_id=product_id,
                     out_dir=work_img_dir,
                     harmonize_model=args.harmonize_model,
+                    user_image_instructions=user_image_resolved,
                 )
                 if harmonized is not None:
                     erased_path = harmonized
@@ -1196,6 +1764,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                         product_id=product_id,
                         out_dir=work_img_dir,
                         restore_model=args.restore_model,
+                        user_image_instructions=user_image_resolved,
                     )
             except Exception as exc:
                 warnings.append(f"step2_restore_failed: {exc}")
@@ -1224,27 +1793,32 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                 "confidence": "low",
             }
 
+        step4_primary_failed = False
         try:
-            en, fr = run_step4_generate_copy(
+            en = run_step4_generate_copy_language(
                 chat=chat,
-                model=args.qwen_model,
+                model=args.english_copy_model,
                 structured_attributes=structured,
                 extracted_text=extracted,
+                user_copy_instructions=user_copy_resolved,
+                target="canadian_english",
             )
         except Exception as exc:
-            warnings.append(f"step4_copy_failed: {exc}")
-            stability_stats["step4_copy_failed"] += 1
+            step4_primary_failed = True
+            warnings.append(f"step4_copy_en_primary_failed: {exc}")
             try:
-                en, fr = run_step4_generate_copy(
+                en = run_step4_generate_copy_language(
                     chat=chat,
-                    model=args.fallback_text_model,
+                    model=args.fallback_english_copy_model,
                     structured_attributes=structured,
                     extracted_text=extracted,
+                    user_copy_instructions=user_copy_resolved,
+                    target="canadian_english",
                 )
-                warnings.append(f"step4_copy_fallback_model_used: {args.fallback_text_model}")
+                warnings.append(f"step4_copy_en_fallback_used: {args.fallback_english_copy_model}")
                 stability_stats["step4_copy_fallback_used"] += 1
-            except Exception as fallback_exc:
-                warnings.append(f"step4_copy_fallback_failed: {fallback_exc}")
+            except Exception as fb_exc:
+                warnings.append(f"step4_copy_en_failed: {fb_exc}")
                 stability_stats["step4_copy_fallback_failed"] += 1
                 en = LocalizedListing(
                     title="Fallback: Product title in Canadian English",
@@ -1252,12 +1826,119 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                     category="Fallback: Category > Subcategory",
                     key_attributes={"status": "fallback"},
                 )
+
+        try:
+            fr = run_step4_generate_copy_language(
+                chat=chat,
+                model=args.french_copy_model,
+                structured_attributes=structured,
+                extracted_text=extracted,
+                user_copy_instructions=user_copy_resolved,
+                target="canadian_french",
+            )
+        except Exception as exc:
+            step4_primary_failed = True
+            warnings.append(f"step4_copy_fr_primary_failed: {exc}")
+            try:
+                fr = run_step4_generate_copy_language(
+                    chat=chat,
+                    model=args.fallback_french_copy_model,
+                    structured_attributes=structured,
+                    extracted_text=extracted,
+                    user_copy_instructions=user_copy_resolved,
+                    target="canadian_french",
+                )
+                warnings.append(f"step4_copy_fr_fallback_used: {args.fallback_french_copy_model}")
+                stability_stats["step4_copy_fallback_used"] += 1
+            except Exception as fb_exc:
+                warnings.append(f"step4_copy_fr_failed: {fb_exc}")
+                stability_stats["step4_copy_fallback_failed"] += 1
                 fr = LocalizedListing(
                     title="Repli : Titre produit en francais canadien",
                     description="Repli : Impossible de generer la copie francaise finale depuis le modele.",
                     category="Repli : Categorie > Sous-categorie",
                     key_attributes={"etat": "repli"},
                 )
+
+        if step4_primary_failed:
+            stability_stats["step4_copy_failed"] += 1
+
+        copy_review: Optional[Dict[str, Any]] = None
+        try:
+            copy_review, cr_side_failed = run_step4b_review_copy_bilingual(
+                chat=chat,
+                model_english=args.copy_review_english_model,
+                model_french=args.copy_review_french_model,
+                product_id=product_id,
+                source_image=source_image,
+                structured_attributes=structured,
+                en=en,
+                fr=fr,
+                user_copy_instructions=user_copy_resolved,
+            )
+            if cr_side_failed:
+                warnings.append("step4b_copy_review_partial_failure: one or both reviewer calls failed")
+                stability_stats["step4b_copy_review_failed"] += 1
+            status = str(copy_review.get("overall_status", "")).lower()
+            if status == "fail":
+                warnings.append(f"copy_review_fail: {copy_review.get('summary', '')}")
+                stability_stats["copy_review_fail"] += 1
+            elif status == "revise":
+                warnings.append(f"copy_review_revise: {copy_review.get('summary', '')}")
+                stability_stats["copy_review_revise"] += 1
+        except Exception as exc:
+            warnings.append(f"step4b_copy_review_failed: {exc}")
+            stability_stats["step4b_copy_review_failed"] += 1
+            copy_review = {
+                "overall_status": "revise",
+                "summary": f"Reviewer call failed: {exc}",
+                "exaggeration_findings": [],
+                "attribute_conflicts": [],
+                "image_visual_mismatches": [],
+                "en_revision_suggestions": "",
+                "fr_revision_suggestions": "",
+                "scores": {},
+            }
+
+        locale_grammar_review: Optional[Dict[str, Any]] = None
+        try:
+            locale_grammar_review = run_step4c_locale_grammar_review(
+                chat=chat,
+                model_english=args.locale_grammar_english_model,
+                model_french=args.locale_grammar_french_model,
+                en=en,
+                fr=fr,
+            )
+            en_g = locale_grammar_review.get("canadian_english", {})
+            fr_g = locale_grammar_review.get("canadian_french", {})
+            if not isinstance(en_g, dict):
+                en_g = {}
+            if not isinstance(fr_g, dict):
+                fr_g = {}
+            en_s = str(en_g.get("status", "pass")).lower()
+            fr_s = str(fr_g.get("status", "pass")).lower()
+            if en_s == "fail" or fr_s == "fail":
+                warnings.append(
+                    "locale_grammar_fail: "
+                    f"en={en_s} fr={fr_s}; "
+                    f"en: {(en_g.get('notes') or '')[:160]} | fr: {(fr_g.get('notes') or '')[:160]}"
+                )
+                stability_stats["locale_grammar_fail"] += 1
+            elif en_s == "revise" or fr_s == "revise":
+                warnings.append(f"locale_grammar_revise: en={en_s} fr={fr_s}")
+                stability_stats["locale_grammar_revise"] += 1
+        except Exception as exc:
+            warnings.append(f"step4c_locale_grammar_failed: {exc}")
+            stability_stats["step4c_locale_grammar_failed"] += 1
+            fb = _normalize_locale_grammar_block(
+                {
+                    "status": "revise",
+                    "issues": [str(exc)],
+                    "suggested_edits": "",
+                    "notes": "Locale grammar reviewer call failed.",
+                }
+            )
+            locale_grammar_review = {"canadian_english": fb, "canadian_french": {**fb}}
 
         additional_images: List[str] = []
         if args.generate_additional_images:
@@ -1270,6 +1951,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                     model=args.additional_image_model,
                     count=args.additional_image_count,
                     structured_attributes=structured,
+                    user_image_instructions=user_image_resolved,
                 )
             except Exception as exc:
                 warnings.append(f"extra_images_failed: {exc}")
@@ -1294,6 +1976,10 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                     else None
                 ),
                 additional_generated_images=additional_images or None,
+                copy_review=copy_review,
+                locale_grammar_review=locale_grammar_review,
+                user_copy_instructions=user_copy_resolved,
+                user_image_instructions=user_image_resolved,
             )
         )
         # Stability baseline aggregation
@@ -1419,14 +2105,70 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument("--restore-model", default=os.getenv("GMI_RESTORE_MODEL", "bria-fibo-restore"), help="Step2 model")
     parser.add_argument(
         "--vision-model",
-        default=os.getenv("GMI_VISION_MODEL", "openai/gpt-4o"),
-        help="Step3 model (vision-capable model in your account, e.g. openai/gpt-4o)",
+        default=os.getenv("GMI_VISION_MODEL", "Qwen/Qwen3-VL-235B"),
+        help="Step3 VLM (multimodal structured attributes).",
     )
-    parser.add_argument("--qwen-model", default=os.getenv("GMI_QWEN_MODEL", "Qwen/Qwen3.5-27B"), help="Step4 Qwen text model")
     parser.add_argument(
-        "--fallback-text-model",
-        default=os.getenv("GMI_FALLBACK_TEXT_MODEL", "openai/gpt-4o-mini"),
-        help="Fallback text model if Qwen call fails.",
+        "--english-copy-model",
+        default=os.getenv("GMI_ENGLISH_COPY_MODEL", "openai/gpt-5.4-pro"),
+        help="Step4 Canadian English listing generation (text JSON).",
+    )
+    parser.add_argument(
+        "--french-copy-model",
+        default=os.getenv("GMI_FRENCH_COPY_MODEL", "anthropic/claude-sonnet-4.6"),
+        help="Step4 Canadian French listing generation (text JSON).",
+    )
+    parser.add_argument(
+        "--fallback-english-copy-model",
+        default=os.getenv("GMI_FALLBACK_ENGLISH_COPY_MODEL", "openai/gpt-5.4-mini"),
+        help="If --english-copy-model fails, retry English generation with this model.",
+    )
+    parser.add_argument(
+        "--fallback-french-copy-model",
+        default=os.getenv("GMI_FALLBACK_FRENCH_COPY_MODEL", "openai/gpt-5.4-mini"),
+        help="If --french-copy-model fails, retry French generation with this model.",
+    )
+    parser.add_argument(
+        "--copy-review-english-model",
+        default=os.getenv("GMI_COPY_REVIEW_ENGLISH_MODEL", "openai/gpt-5.4"),
+        help="Step4b vision JSON audit for English listing vs image (required).",
+    )
+    parser.add_argument(
+        "--copy-review-french-model",
+        default=os.getenv("GMI_COPY_REVIEW_FRENCH_MODEL", "anthropic/claude-sonnet-4.6"),
+        help="Step4b vision JSON audit for French listing vs image (required).",
+    )
+    parser.add_argument(
+        "--locale-grammar-english-model",
+        default=os.getenv("GMI_LOCALE_GRAMMAR_ENGLISH_MODEL", "openai/gpt-5.4-nano"),
+        help="Step4c text JSON Canadian English grammar review (required).",
+    )
+    parser.add_argument(
+        "--locale-grammar-french-model",
+        default=os.getenv("GMI_LOCALE_GRAMMAR_FRENCH_MODEL", "openai/gpt-5.4-nano"),
+        help="Step4c text JSON Canadian French grammar review (required).",
+    )
+    parser.add_argument(
+        "--user-copy-instructions",
+        default="",
+        help="Optional operator notes for listing copy (tone, length, SEO, audience). Injected into step4; also shown to copy reviewer. "
+        "Appended after GMI_USER_COPY_INSTRUCTIONS if set.",
+    )
+    parser.add_argument(
+        "--user-copy-instructions-file",
+        default=None,
+        help="UTF-8 file whose contents replace inline --user-copy-instructions when the file exists.",
+    )
+    parser.add_argument(
+        "--user-image-instructions",
+        default="",
+        help="Optional operator notes for image pipeline (background, lighting, mood). Used in model erase, harmonize, restore, extra shots. "
+        "Appended after GMI_USER_IMAGE_INSTRUCTIONS if set.",
+    )
+    parser.add_argument(
+        "--user-image-instructions-file",
+        default=None,
+        help="UTF-8 file whose contents replace inline --user-image-instructions when the file exists.",
     )
     args = parser.parse_args(argv)
     if args.no_harmonize_after_erase:

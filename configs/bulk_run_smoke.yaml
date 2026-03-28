@@ -18,9 +18,15 @@ pipeline:
   harmonize_after_erase: false
   mock: true
 
-  vision_model: openai/gpt-4o
-  qwen_model: Qwen/Qwen3.5-27B
-  fallback_text_model: openai/gpt-4o-mini
+  vision_model: Qwen/Qwen3-VL-235B
+  english_copy_model: openai/gpt-5.4-pro
+  french_copy_model: anthropic/claude-sonnet-4.6
+  fallback_english_copy_model: openai/gpt-5.4-mini
+  fallback_french_copy_model: openai/gpt-5.4-mini
+  copy_review_english_model: openai/gpt-5.4
+  copy_review_french_model: anthropic/claude-sonnet-4.6
+  locale_grammar_english_model: openai/gpt-5.4-nano
+  locale_grammar_french_model: openai/gpt-5.4-nano
   generate_additional_images: false
   max_attempts: 2
   stability_update_every: 1

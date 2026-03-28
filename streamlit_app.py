@@ -1,6 +1,6 @@
 """Minimal Streamlit UI for the MTWI ecommerce pipeline.
 
-Run from repository root (see root README.md for venv, API key, and `streamlit run streamlit_app.py`).
+Run from repository root (see README.md for demo_one Streamlit steps; CONFIGURATION.md for API key and advanced options).
 
 Batch / training CLI is documented in src/README.md.
 """
@@ -120,6 +120,16 @@ def render_result_preview(job_dir: Path) -> None:
         else:
             st.caption("无 `description_fr.md`")
 
+    review_path = pkg / "copy_review.md"
+    if review_path.is_file():
+        st.markdown("### 文案质检（事实 / 夸张 / 与图一致性）")
+        st.markdown(review_path.read_text(encoding="utf-8"))
+
+    loc_path = pkg / "locale_grammar_review.md"
+    if loc_path.is_file():
+        st.markdown("### 加拿大英语 + 加拿大法语语法质检")
+        st.markdown(loc_path.read_text(encoding="utf-8"))
+
     manifest = pkg / "manifest.json"
     if manifest.is_file():
         with st.expander("manifest.json（原始 JSON）", expanded=False):
@@ -135,7 +145,16 @@ def render_result_preview(job_dir: Path) -> None:
 def main() -> None:
     st.set_page_config(page_title="MTWI Agent", page_icon="🖼️", layout="wide")
     st.title("MTWI 商品图 Agent（基础版）")
-    st.caption("上传商品图 + 按 MTWI 格式的坐标文本，一键跑通去字 / 理解与英法文案 / 可选扩展图。")
+    st.caption(
+        "上传商品图 + MTWI 坐标文本：去字 / 多模态理解 / 英法分模型文案；4b·4c 质检固定执行；可选扩展图。推理经 GMI Cloud。"
+    )
+
+    st.markdown(
+        """
+**页面结构**：侧栏 **运行配置**（Mock、Key、链路开关、模型名）→ 主区 **1 上传图片** → **2 文本框标注**
+→ **3 用户要求（可选）** → **开始处理** → **4 结果预览** → **5 下载**。
+"""
+    )
 
     with st.sidebar:
         st.header("运行配置")
@@ -149,11 +168,43 @@ def main() -> None:
         harmonize = st.checkbox("去字后模型自然修复（harmonize）", value=False)
         gen_extra = st.checkbox("生成扩展营销图（3 张）", value=True)
         disable_restore = st.checkbox("关闭模型 restore（推荐，减少 500）", value=True)
+        st.caption("步骤 4b（英法文案质检）与 4c（语法质检）固定执行，每件含多次 LLM 调用。")
 
         st.subheader("模型（可改）")
-        vision_model = st.text_input("视觉模型", value=os.getenv("GMI_VISION_MODEL", "openai/gpt-4o"))
-        qwen_model = st.text_input("文案主模型", value=os.getenv("GMI_QWEN_MODEL", "Qwen/Qwen3.5-27B"))
-        fallback_model = st.text_input("文案回退模型", value=os.getenv("GMI_FALLBACK_TEXT_MODEL", "openai/gpt-4o-mini"))
+        vision_model = st.text_input("多模态理解（步骤3）", value=os.getenv("GMI_VISION_MODEL", "Qwen/Qwen3-VL-235B"))
+        english_copy_model = st.text_input(
+            "英文文案生成（步骤4）",
+            value=os.getenv("GMI_ENGLISH_COPY_MODEL", "openai/gpt-5.4-pro"),
+        )
+        french_copy_model = st.text_input(
+            "法文文案生成（步骤4）",
+            value=os.getenv("GMI_FRENCH_COPY_MODEL", "anthropic/claude-sonnet-4.6"),
+        )
+        with st.expander("回退与审稿模型（高级）", expanded=False):
+            fb_en = st.text_input(
+                "英文生成回退",
+                value=os.getenv("GMI_FALLBACK_ENGLISH_COPY_MODEL", "openai/gpt-5.4-mini"),
+            )
+            fb_fr = st.text_input(
+                "法文生成回退",
+                value=os.getenv("GMI_FALLBACK_FRENCH_COPY_MODEL", "openai/gpt-5.4-mini"),
+            )
+            cr_en = st.text_input(
+                "英文文案质检（步骤4b·视觉）",
+                value=os.getenv("GMI_COPY_REVIEW_ENGLISH_MODEL", "openai/gpt-5.4"),
+            )
+            cr_fr = st.text_input(
+                "法文文案质检（步骤4b·视觉）",
+                value=os.getenv("GMI_COPY_REVIEW_FRENCH_MODEL", "anthropic/claude-sonnet-4.6"),
+            )
+            lg_en = st.text_input(
+                "英文语法质检（步骤4c）",
+                value=os.getenv("GMI_LOCALE_GRAMMAR_ENGLISH_MODEL", "openai/gpt-5.4-nano"),
+            )
+            lg_fr = st.text_input(
+                "法文语法质检（步骤4c）",
+                value=os.getenv("GMI_LOCALE_GRAMMAR_FRENCH_MODEL", "openai/gpt-5.4-nano"),
+            )
 
     st.subheader("1. 上传图片")
     image_file = st.file_uploader("商品图（PNG / JPG）", type=["png", "jpg", "jpeg", "webp"])
@@ -173,6 +224,35 @@ def main() -> None:
     ann_upload = st.file_uploader("或上传 .txt", type=["txt"])
     if ann_upload is not None:
         ann_text = ann_upload.read().decode("utf-8", errors="replace")
+
+    st.subheader("3. 用户要求（可选）")
+    st.markdown(
+        "用自然语言写你对**整单任务**的期望；会**同时**传给文案侧与图像侧（与下方专项叠加）。"
+        "勿粘贴 API Key；可与环境变量 `GMI_USER_*` 叠加。"
+    )
+    user_requirements = st.text_area(
+        "用户要求（总述）",
+        value="",
+        height=120,
+        key="user_requirements_general",
+        help="合并进 --user-copy-instructions 与 --user-image-instructions；适合写整体语气、渠道、禁忌等。",
+        placeholder="例如：面向加拿大电商；标题简短；图像偏干净白底、少装饰。",
+    )
+    with st.expander("文案 / 图像 专项（可选，与总述叠加）", expanded=False):
+        user_copy_instr = st.text_area(
+            "文案：风格与约束",
+            value="",
+            height=100,
+            help="仅文案：英法生成与文案质检。在总述之后追加。",
+            placeholder="例如：要点式描述、标题不超过 80 字符；避免无法核实的绝对化用语。",
+        )
+        user_image_instr = st.text_area(
+            "图像：整体风格",
+            value="",
+            height=100,
+            help="仅图像：去字、harmonize、restore、扩展图。在总述之后追加。",
+            placeholder="例如：纯白电商底、柔和顶光、少阴影。",
+        )
 
     run_clicked = st.button("开始处理", type="primary", use_container_width=True)
 
@@ -226,10 +306,22 @@ def main() -> None:
             mask_mode,
             "--vision-model",
             vision_model.strip(),
-            "--qwen-model",
-            qwen_model.strip(),
-            "--fallback-text-model",
-            fallback_model.strip(),
+            "--english-copy-model",
+            english_copy_model.strip(),
+            "--french-copy-model",
+            french_copy_model.strip(),
+            "--fallback-english-copy-model",
+            fb_en.strip(),
+            "--fallback-french-copy-model",
+            fb_fr.strip(),
+            "--copy-review-english-model",
+            cr_en.strip(),
+            "--copy-review-french-model",
+            cr_fr.strip(),
+            "--locale-grammar-english-model",
+            lg_en.strip(),
+            "--locale-grammar-french-model",
+            lg_fr.strip(),
             "--max-attempts",
             "2",
             "--stability-update-every",
@@ -258,6 +350,17 @@ def main() -> None:
         if mock:
             argv.append("--mock")
 
+        def _merge_instructions(general: str, specific: str) -> str:
+            parts = [p.strip() for p in (general, specific) if p and p.strip()]
+            return "\n\n".join(parts)
+
+        copy_merged = _merge_instructions(user_requirements, user_copy_instr)
+        image_merged = _merge_instructions(user_requirements, user_image_instr)
+        if copy_merged:
+            argv.extend(["--user-copy-instructions", copy_merged])
+        if image_merged:
+            argv.extend(["--user-image-instructions", image_merged])
+
         with st.spinner("处理中，请稍候…"):
             try:
                 args = parse_args(argv)
@@ -274,10 +377,10 @@ def main() -> None:
         jd = Path(job_key)
         if jd.is_dir():
             st.divider()
-            st.subheader("3. 结果预览")
+            st.subheader("4. 结果预览")
             render_result_preview(jd)
 
-            st.subheader("4. 下载")
+            st.subheader("5. 下载")
             zbytes = build_zip(jd)
             st.download_button(
                 label="下载本次运行目录（ZIP：deliverables、YAML、过程图等）",
