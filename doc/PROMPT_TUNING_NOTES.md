@@ -59,7 +59,7 @@
 
 ### 7) 步骤 4b（必选 LLM 文案质检，英法分模型）
 
-- **调用**：英文 listing 用 `--copy-review-english-model`（默认 `openai/gpt-5.4`），法文 listing 用 `--copy-review-french-model`（默认 `anthropic/claude-sonnet-4.6`）；各须支持**图像 + JSON**。**不引入** LangChain/Crew 等多智能体框架。
+- **调用**：英 / 法 listing 各一次：`--copy-review-english-model` 与 `--copy-review-french-model`（**默认均为** `anthropic/claude-sonnet-4.6`）；须支持**图像 + JSON**。**不引入** LangChain/Crew 等多智能体框架。
 - **角色**：各审稿员只审**对应语言**的 listing，对照**原图** + **结构化属性**，查夸张营销、与属性矛盾、与画面不符的断言。
 - **合并输出**：`overall_status` 取两侧较严；`summary` 拼接 EN/FR；`en_revision_suggestions` / `fr_revision_suggestions` 分别来自两侧；`scores` 取 grounding / factual_tone 的较小值。
 - **与规则评估的关系**：`eval_copy_quality.py` 仍做格式/语言启发式；本步是**语义与事实**补充，二者互补。

@@ -92,7 +92,7 @@ def build_pipeline_cmd(cfg: Dict[str, Any], run_dir: Path) -> List[str]:
             )
         ),
         "--copy-review-english-model",
-        str(pipeline_cfg.get("copy_review_english_model", "openai/gpt-5.4")),
+        str(pipeline_cfg.get("copy_review_english_model", "anthropic/claude-sonnet-4.6")),
         "--copy-review-french-model",
         str(pipeline_cfg.get("copy_review_french_model", "anthropic/claude-sonnet-4.6")),
         "--locale-grammar-english-model",
@@ -128,7 +128,8 @@ def build_pipeline_cmd(cfg: Dict[str, Any], run_dir: Path) -> List[str]:
         )
     else:
         cmd.append("--no-harmonize-after-erase")
-    if bool(pipeline_cfg.get("generate_additional_images", True)):
+    if bool(pipeline_cfg.get("generate_additional_images", False)):
+        cmd.append("--generate-additional-images")
         cmd.extend(
             [
                 "--additional-image-model",
@@ -137,6 +138,9 @@ def build_pipeline_cmd(cfg: Dict[str, Any], run_dir: Path) -> List[str]:
                 str(int(pipeline_cfg.get("additional_image_count", 3))),
             ]
         )
+        fam = pipeline_cfg.get("fallback_additional_image_model")
+        if fam is not None and str(fam).strip():
+            cmd.extend(["--fallback-additional-image-model", str(fam).strip()])
     else:
         cmd.append("--no-generate-additional-images")
     if bool(pipeline_cfg.get("disable_restore", True)):

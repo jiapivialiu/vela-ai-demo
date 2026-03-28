@@ -20,7 +20,7 @@
 | **跳过 4b+4c** | 可选 | — | `--skip-listing-review` | `GMI_SKIP_LISTING_REVIEW` |
 | **步骤4 英语回退** | unified 双语重试 / split 英回退 | `openai/gpt-5.4-mini` | `--fallback-english-copy-model` | `GMI_FALLBACK_ENGLISH_COPY_MODEL` |
 | **步骤4 法语回退** | 仅 split 法回退 | `openai/gpt-5.4-mini` | `--fallback-french-copy-model` | `GMI_FALLBACK_FRENCH_COPY_MODEL` |
-| **4b 英文文案质检 Agent**（默认开；可跳过） | **GPT-5.4** | `openai/gpt-5.4` | `--copy-review-english-model` | `GMI_COPY_REVIEW_ENGLISH_MODEL` |
+| **4b 英文文案质检 Agent**（默认开；可跳过） | **Claude Sonnet 4.6**（与法侧同档、同调用形态） | `anthropic/claude-sonnet-4.6` | `--copy-review-english-model` | `GMI_COPY_REVIEW_ENGLISH_MODEL` |
 | **4b 法文文案质检 Agent**（默认开；可跳过） | **Claude Sonnet 4.6** | `anthropic/claude-sonnet-4.6` | `--copy-review-french-model` | `GMI_COPY_REVIEW_FRENCH_MODEL` |
 | **4c 英文语法质检 Agent**（默认开；可跳过） | **gpt-5.4-nano** | `openai/gpt-5.4-nano` | `--locale-grammar-english-model` | `GMI_LOCALE_GRAMMAR_ENGLISH_MODEL` |
 | **4c 法文语法质检 Agent**（默认开；可跳过） | **gpt-5.4-nano** | `openai/gpt-5.4-nano` | `--locale-grammar-french-model` | `GMI_LOCALE_GRAMMAR_FRENCH_MODEL` |
@@ -55,9 +55,9 @@
 | 图像模型 | 步骤1 model 擦除 | 默认同扩展图 **`seedream-5.0-lite`** | `--eraser-model` | `GMI_ERASER_MODEL`（未设则与 `GMI_ADDITIONAL_IMAGE_MODEL` / `--additional-image-model` 一致） |
 | 图像模型 | 步骤2 harmonize | `bria-fibo-edit` | `--harmonize-model` | `GMI_HARMONIZE_MODEL` |
 | 图像模型 | 步骤2 restore | `bria-fibo-restore` | `--restore-model` | `GMI_RESTORE_MODEL` |
-| 图像模型 | 扩展营销图（**默认生成 3 张**） | `seedream-5.0-lite` | `--additional-image-model` / `--no-generate-additional-images` | `GMI_ADDITIONAL_IMAGE_MODEL` / `GMI_GENERATE_ADDITIONAL_IMAGES` |
+| 图像模型 | 扩展营销图（**主链路默认关**；独立步骤见 `run_marketing_extras_step.py`） | `seedream-5.0-lite` | `--generate-additional-images` / `--additional-image-count` / `--additional-image-model` | `GMI_ADDITIONAL_IMAGE_MODEL` / `GMI_GENERATE_ADDITIONAL_IMAGES` |
 
-**策略默认**：`--annotation-audit` **默认开启**（仅 **真实模式**）；`--erase-strategy` 默认 **`model`**（与扩展图同档 RQ 去字）；`--quality-strategy` 默认 `local`；`--mask-mode` 默认 **`all`**；**扩展营销图默认开启**；harmonize 默认开启，可用 `--no-harmonize-after-erase` 关闭。离线/省钱可用 `--erase-strategy local`。
+**策略默认**：`--annotation-audit` **默认开启**（仅 **真实模式**）；`--erase-strategy` 默认 **`model`**（与 `--additional-image-model` 同档 RQ 去字）；`--quality-strategy` 默认 `local`；`--mask-mode` 默认 **`all`**；**扩展营销图默认关闭**（`--generate-additional-images` 或 `GMI_GENERATE_ADDITIONAL_IMAGES=1` 开启）；harmonize 默认开启，可用 `--no-harmonize-after-erase` 关闭。离线/省钱可用 `--erase-strategy local`。
 
 ---
 
@@ -115,19 +115,18 @@
           ▼                               ▼
 ┌─────────────────────┐       ┌─────────────────────────────┐
 │【Agent·必选】4b     │       │【Agent·必选】4c               │
-│ 英文文案质检         │       │ 两语言语法质检 **均为**        │
-│ GPT-5.4 →           │       │ `openai/gpt-5.4-nano`        │
-│ `openai/gpt-5.4`    │       │ （英、法各 1 次文本 JSON）      │
-│ 法文文案质检         │       │                              │
-│ Claude Sonnet 4.6 → │       │                              │
+│ 英 / 法 文案质检     │       │ 两语言语法质检 **均为**        │
+│ **均为** Claude      │       │ `openai/gpt-5.4-nano`        │
+│ Sonnet 4.6 →        │       │ （英、法各 1 次文本 JSON）      │
 │ `anthropic/claude-  │       │                              │
 │  sonnet-4.6`        │       │                              │
+│ （各 1 次视觉 JSON）  │       │                              │
 └──────────┬──────────┘       └──────────────┬──────────────┘
            └───────────────┬───────────────┘
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  可选：扩展营销图 → `seedream-5.0-lite`                        │
+│  可选：扩展营销图（主链路默认关；或 `run_marketing_extras_step.py`）→ `seedream-5.0-lite` │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**输出物**：过程图、`mtwi_ecommerce_samples.yaml`；`--export-deliverables` 时含 **`description_en.md` / `description_fr.md` / `product_image.png` / `manifest.json`**、**`copy_review.md`**、**`locale_grammar_review.md`**。命令行见 [src/README.md](src/README.md)；Prompt 见 [PROMPT_TUNING_NOTES.md](PROMPT_TUNING_NOTES.md)。
+**输出物**：过程图、`mtwi_ecommerce_samples.yaml`；`--export-deliverables` 时含 **`description_en.md` / `description_fr.md` / `product_image.png` / `manifest.json`**、**`copy_review.md`**、**`locale_grammar_review.md`**；扩展图 **`product_image_extra_*`** 仅在开启主链路扩展图或单独跑营销步骤时写入。命令行见 [src/README.md](src/README.md)；Prompt 见 [PROMPT_TUNING_NOTES.md](PROMPT_TUNING_NOTES.md)。

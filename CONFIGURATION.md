@@ -5,7 +5,7 @@
 ## 推理栈（与 agent.md 一致）
 
 - **对话推理**：步骤 3 / 4 / 4b / 4c 经 GMI **Chat**（多模态或文本 JSON）。**4b、4c 默认运行**；可用 **`--skip-listing-review`** 或 **`GMI_SKIP_LISTING_REVIEW=1`** 跳过（交付包不写质检 markdown）。
-- **图像任务**：擦除 / harmonize / restore / **扩展营销图（默认 3 张）**经 GMI **Request Queue**（非 chat）。CLI **默认开启** 三种场景（不同角度 → 真人使用 → 不同背景/使用场景）；关闭：`--no-generate-additional-images` 或 `GMI_GENERATE_ADDITIONAL_IMAGES=0`。
+- **图像任务**：擦除 / harmonize / restore 经 GMI **Request Queue**（非 chat）。**扩展营销图**在 **主链路默认不生成**（避免与主流程混用 RQ 负载）；需要时在 CLI 加 **`--generate-additional-images`** 与 **`--additional-image-count`**，或跑独立脚本 **`src/run_marketing_extras_step.py`**（仅用 `*_final.png` + RQ，写入已有交付目录）。环境变量 **`GMI_GENERATE_ADDITIONAL_IMAGES=1`** 可开启主链路扩展图。
 - **产品级 LLM 规格与 `model_id` 对照表**（Qwen3-VL-235B、GPT-5.4-pro、Claude Sonnet 4.6、GPT-5.4、gpt-5.4-nano 等）：见 **[agent.md](agent.md)** 文首 **「LLM 与 Agent 规格」**；含脚本/YAML 一致性说明与每 SKU 约 **6**（unified 默认）或 **7**（split）次 chat 说明。
 
 ## 文案生成（步骤4）vs 质检（4b / 4c）
@@ -22,6 +22,10 @@
 - **split**：主模型为 **`--english-copy-model`**（同一双图双语调用；**不再**对英法各走单独 `english-copy-model` / `french-copy-model` 并行生成）。回退与 **split** 专用 **`--french-copy-model` / `--fallback-french-copy-model`** 仍保留在 CLI 供将来扩展，当前双图路径未使用法语主模型。可再走 `--simple-copy-model` 抢救。
 
 环境变量：`GMI_COPY_GENERATION_MODE=unified|split`（默认 **unified**），`GMI_UNIFIED_COPY_MODEL`。Bulk：`pipeline.copy_generation_mode`、`pipeline.unified_copy_model`。
+
+## 全自动去字预处理（无 MTWI）
+
+独立脚本 **`src/auto_text_erase_preprocess.py`**：目录入目录出，**PaddleOCR** 检测 + **RQ** 擦除 / **bria-fibo-edit** 修色；可选 **`--quads-json`** 提供四角坐标以绕过 OCR。环境变量：**`GMI_AUTO_ERASE_RQ_TIMEOUT`**（默认 30，秒）、**`GMI_AUTO_ERASE_MAX_ATTEMPTS`**（默认 2，含首次请求后的重试次数）。详见 **`doc/DEV_LOG.md`**。
 
 ## GMI API Key
 
@@ -62,8 +66,20 @@ GMI_GENERATE_ADDITIONAL_IMAGES
 GMI_EXTRA_IMAGES_BATCH
 GMI_EXTRA_IMAGES_USE_EDIT_FALLBACK
 GMI_EXTRA_IMAGES_PLACEHOLDER
+GMI_EXTRA_IMAGES_MAX_PARALLEL
+GMI_FALLBACK_IMAGE_MODEL
 GMI_EXTRA_IMAGES_DEBUG
+GMI_EXTRA_IMAGES_SEEDREAM_USE_EDIT_FALLBACK
+GMI_EXTRA_IMAGES_SEEDREAM_BACKFILL_CAP
 GMI_RQ_OUTCOME_DEBUG
+GMI_RQ_OUTCOME_DEBUG_DEEP
+GMI_RQ_HTTP_SUBMIT_TIMEOUT
+GMI_RQ_HTTP_CONNECT_TIMEOUT
+GMI_RQ_POLL_READ_TIMEOUT
+GMI_RQ_POLL_CONNECT_TIMEOUT
+GMI_PIPELINE_PROGRESS_FILE
+GMI_AUTO_ERASE_RQ_TIMEOUT
+GMI_AUTO_ERASE_MAX_ATTEMPTS
 GMI_ERASE_STRATEGY
 GMI_LOCAL_INPAINT_RADIUS
 GMI_QUALITY_STRATEGY
@@ -93,20 +109,24 @@ GMI_DEMO_USE_ENV_IMAGE_MODEL
 - **`GMI_CHAT_JSON_RESPONSE_FORMAT`**：设为 `1` / `true` / `yes` / `on`（默认）时，先请求 `response_format: json_object`；若网关返回 400，会自动再试不带该字段。设为 `0` / `false` / `off` 则始终不传 `response_format`（依赖提示词 + 解析器从正文里抽 JSON）。
 - **`GMI_SIMPLE_COPY_MODEL`**：仅 **`split`** 文案链路。当英法分调仍落到启发式或描述为空时，再发 **一次** 双语 JSON（不传 `response_format`）。默认同 **`GMI_FALLBACK_ENGLISH_COPY_MODEL`**。关闭：`--no-simple-copy-recovery` 或 bulk `no_simple_copy_recovery: true`。
 - **`GMI_UNIFIED_COPY_MODEL`**：仅 **`unified`** 主路径。未设置时默认与 **`GMI_ENGLISH_COPY_MODEL`** 相同（当前仓库默认 **`openai/gpt-5.4-pro`**）。
-- **`GMI_GENERATE_ADDITIONAL_IMAGES`**：`1` / `true` / `on` 与 `0` / `false` / `off` 覆盖是否生成 **Request Queue** 扩展图（默认生成，与 CLI 一致）。
+- **`GMI_GENERATE_ADDITIONAL_IMAGES`**：`1` / `true` / `on` 强制主链路生成 **Request Queue** 扩展图；`0` / `false` / `off` 强制关闭。**不设置**时与 CLI 一致：**默认不生成**（需 **`--generate-additional-images`** 或本变量 `1`）。
 - **`GMI_EXTRA_IMAGES_BATCH`**：默认 **不设置** = 扩展图 **每张单独** 调 RQ（`num_images=1`，与早期版本一致，多数 RQ 图像模型对单张更稳）。设为 `1` / `true` / `on` 时先尝试 **单次** `num_images=N` 的多图 prompt，不足再按张补全。
-- **`GMI_EXTRA_IMAGES_USE_EDIT_FALLBACK`**：默认 **`1` / on** — 当 **变体** 接口仍无 `media_urls` 时，对缺额用 **`run_image_edit`**（与去字相同的 RQ payload 形态）逐张生成扩展图。设为 `0` / `false` / `off` 关闭。
-- **`GMI_EXTRA_IMAGES_PLACEHOLDER`**：设为 `1` / `true` / `on` 时，若 RQ 仍无图，用 **参考图（final）字节复制** 填满缺额，保证 `product_image_extra_*` 数量；`manifest.warnings` 会写 **`extra_images_placeholder`**。**`src/run_one_deliverable_example.sh` 默认 `GMI_EXTRA_IMAGES_PLACEHOLDER=1`**（可用 `=0` 关闭）。
+- **`GMI_EXTRA_IMAGES_USE_EDIT_FALLBACK`**：默认 **不设置 = off** — 扩展图仅 **`run_image_variants`**（路径 1）+ 可选 **`GMI_FALLBACK_IMAGE_MODEL`**。设为 `1` / `true` / `on` 时，在变体仍无可用图后再走 **`run_image_edit`**（路径 2，与去字同形态）。**Seedream** 即使设为 `1`，仍需同时 **`GMI_EXTRA_IMAGES_SEEDREAM_USE_EDIT_FALLBACK=1`** 才会启用路径 2。
+- **`GMI_EXTRA_IMAGES_SEEDREAM_USE_EDIT_FALLBACK`**：仅当已开启 **`GMI_EXTRA_IMAGES_USE_EDIT_FALLBACK`** 时才有意义。对 **`model_id` 含 `seedream`** 的扩展图，还须 **`GMI_EXTRA_IMAGES_SEEDREAM_USE_EDIT_FALLBACK=1`** 才会在路径 1 之后走 **`run_image_edit`**（路径 2）；否则 Seedream 始终只做变体接口。
+- **`GMI_EXTRA_IMAGES_SEEDREAM_BACKFILL_CAP`**：Seedream 扩展图 **generic backfill** 最大轮数，默认 **`2`**（非 Seedream 仍为 **6**）。设为 `0` 可关闭 backfill。
+- **扩展图 RQ 失败可见性**：每次 **`run_image_variants` / `run_image_edit`**（含 batch 首调）若抛错，会向 **stderr** 与 **`manifest.warnings`** 写入一行 **`extra_images_rq_<stage>_failed: …`**（含 `TimeoutError` / `RuntimeError` 等），不再静默吞掉异常。
+- **`GMI_EXTRA_IMAGES_PLACEHOLDER`**：设为 `1` / `true` / `on` 时，若 RQ 仍无图，用 **参考图（final）字节复制** 填满缺额，保证 `product_image_extra_*` 数量；`manifest.warnings` 会写 **`extra_images_placeholder`**。**默认不设置 = 不复制**（缺额见 `extra_images_shortfall`）。`run_one_deliverable_example.sh` **不** export 此变量；主链路默认也不生成扩展图，需另开 `--generate-additional-images` 或跑 `run_marketing_extras_step.py` 才会遇到占位逻辑。
 - **`GMI_EXTRA_IMAGES_DEBUG`**：设为 `1` / `true` / `on` 时，在 **`manifest.warnings`** 与 **stderr** 中记录扩展图相关 RQ 调用的 **prompt 长度、sha256 前 12 位、开头约 200 字符**，以及 **`returned_bytes`**（是否拿到图像字节）。用于确认每张扩展图是否使用了 **不同的完整 prompt**（若三张图仍相同，多半是 placeholder 复制而非单一 prompt）。
-- **`GMI_RQ_OUTCOME_DEBUG`**：设为 `1` / `true` / `on` 时，当 **`run_image_variants` / `run_image_edit`** 未解析出任何图像字节，在 **stderr** 打印一行 **`GMI RQ outcome debug […]`**：`outcome` 顶层字段名、类型、列表长度、字符串头片段（**不**打印完整 base64）。用于对照 GMI 控制台返回 JSON，扩展 **`extract_media_bytes_from_outcome`** 或核对 **`GMI_MEDIA_BASE_URL`** / 模型是否真产出图像。
+- **`GMI_RQ_OUTCOME_DEBUG`**：设为 `1` / `true` / `on` 时，当 **`run_image_variants` / `run_image_edit`** 未解析出任何图像字节，在 **stderr** 打印一行 **`GMI RQ outcome debug […]`**：仅 **`outcome` 顶层**字段的**摘要**（子 dict 的 key 名列表前若干项、list 长度、字符串**前约 72 字符**等），**不是**完整 JSON，也**不**打印整段 base64。用于对照 GMI 控制台或补 **`extract_*_from_outcome`** 路径。
+- **`GMI_RQ_OUTCOME_DEBUG_DEEP`**：设为 `1` / `true` / `on` 时，在 **stderr** 额外打印 **`GMI RQ outcome debug-deep […]`**：**最多约 3 层**嵌套的 key / 类型 / 字符串 `len + head` 树（仍截断长串，不落盘完整图像数据）。可**单独**开启（不必同时开 `GMI_RQ_OUTCOME_DEBUG`），便于看清 Seedream 等返回的 `data` / `images` / `outputs` 结构。
 
 **RQ 扩展图拿不到图、只能复制 final（`extra_images_placeholder`）时怎么排查**
 
 1. **先确认不是「演示用占位」**：`GMI_EXTRA_IMAGES_PLACEHOLDER=0` — 不复制 final，缺几张就只生成几张并 **`extra_images_shortfall`**，避免误以为模型生成了三张不同的图。
-2. **看网关实际回了什么**：同一 run 加 **`GMI_RQ_OUTCOME_DEBUG=1`**，看 stderr 里 `outcome` 是否有 `media_urls` / `images` / 内嵌 base64；若几乎是空 `{}`，多为 **模型未产出或 request 被拒**（控制台看该 `request_id`）。
+2. **看网关实际回了什么**：同一 run 加 **`GMI_RQ_OUTCOME_DEBUG=1`**，必要时再加 **`GMI_RQ_OUTCOME_DEBUG_DEEP=1`**，看 stderr 里是否有 `media_urls` / `images` / `data` 嵌套等；若几乎是空 `{}`，多为 **模型未产出或 request 被拒**（控制台看该 `request_id`）。
 3. **核对端点与模型**：`GMI_MEDIA_BASE_URL` 默认 Inference Engine Request Queue；`model_id` 须与账户开通的一致（如 **`seedream-5.0-lite`**）。
-4. **解析已加强**：代码会从 `media_urls[].uri` / `href`、`images` / `outputs` 列表、顶层 `data:` URL 等路径取图；若仍失败，把 **`GMI RQ outcome debug`** 一行（脱敏后）交给支持或自行对照文档补字段。
-5. **超时**：`GMI_IMAGE_TIMEOUT`（秒）默认擦除 240、变体 300，过短可能轮询未到 `success`。
+4. **解析路径**：除 `media_urls` 外，会尝试 **`images` / `outputs` / `files` / `media` / `items`** 列表、**顶层或嵌套 `data` / `content` 字符串**（data-URL 或裸 base64）、以及 **`result` / `data` / `output` 等包裹键**下的 dict / list / 字符串。`run_image_variants` 对 **`media_urls` 每项 dict** 使用与 **`extract_media_bytes_from_outcome`** 一致的单节点解析。若仍失败，把 **debug / debug-deep** 输出（脱敏）对照文档或交给支持。
+5. **超时**：`GMI_IMAGE_TIMEOUT`（秒）默认擦除 **240**、变体 **300**，控制**轮询总时长**（等到 `success`/`failed`）。另：RQ **提交** `POST` 原先用固定 **60s** 读超时，大图 base64 或网关慢时易 **`ReadTimeout`**；现已默认 **`max(120, min(900, GMI_IMAGE_TIMEOUT))`** 秒读超时（与当次任务的 `timeout_s` 一致）。可显式设 **`GMI_RQ_HTTP_SUBMIT_TIMEOUT`**（秒，单次提交读超时）、**`GMI_RQ_HTTP_CONNECT_TIMEOUT`**（连接，默认 30）、**`GMI_RQ_POLL_READ_TIMEOUT`** / **`GMI_RQ_POLL_CONNECT_TIMEOUT`**（轮询 GET，读默认 90）。
 - **`GMI_MASK_MODE`**：`all`（默认）= txt 中全部四边形参与蒙版擦除；`overlay` = 仅擦叠加水印类框（在线 VLM + 启发式；Mock 无匹配时回退为全部框）。
 - **`GMI_ANNOTATION_AUDIT`**：`1` / `true` / `on` 与 `0` / `false` / `off` 覆盖是否在擦除前运行 **标注审核 VLM**（默认开启；**Mock 始终跳过**）。
 - **`GMI_ANNOTATION_AUDIT_MODEL`**：审核专用 VLM；未设置时与 **`GMI_VISION_MODEL`** 相同。
@@ -114,7 +134,7 @@ GMI_DEMO_USE_ENV_IMAGE_MODEL
 - **`GMI_LOCAL_INPAINT_RADIUS`**：`erase-strategy=local` 时，蒙版内先 **白底** 再 **OpenCV `inpaint`（NS）** 融合边界；半径默认 **`6`**（约 1–24）。需安装 **`opencv-python-headless`** 与 **`numpy`**；未安装时回退旧版「邻条粘贴」逻辑。
 - **`GMI_ERASE_STRATEGY`**：`model`（默认）= 步骤1 用 Request Queue 去字；`local` = 仅本地 inpaint，不调去字 RQ。
 - **`GMI_ERASER_MODEL`**：去字 RQ 的 `model_id`；**不设置** 时与 **`GMI_ADDITIONAL_IMAGE_MODEL`**（及 CLI `--additional-image-model`）一致，便于与扩展图同档画质。
-- **仅试扩展图（不调 Chat）**：`python src/try_additional_images_only.py --reference-image outputs/.../demo_item_final.png --model <image_model_id>`。默认 RQ 去字与扩展图均为 **`seedream-5.0-lite`**；若去字与扩展图要用 **不同** `model_id`，分别设 **`GMI_ERASER_MODEL`** 与 **`GMI_ADDITIONAL_IMAGE_MODEL`**。
+- **仅试扩展图（不调 Chat）**：`python src/try_additional_images_only.py --reference-image demo_outputs/.../demo_item_final.png --model <image_model_id>`（不写交付包；默认路径对齐 **`run_one_deliverable_example.sh`** 的 **`DEMO_OUTPUT_ROOT`**，默认 **`demo_outputs`**）。**已有交付目录补写** `product_image_extra_*` + manifest：`python src/run_marketing_extras_step.py --reference-image … --deliverable-dir … --product-id …`。默认 RQ 去字与扩展图均为 **`seedream-5.0-lite`**；若去字与扩展图要用 **不同** `model_id`，分别设 **`GMI_ERASER_MODEL`** 与 **`GMI_ADDITIONAL_IMAGE_MODEL`**。
 
 默认值与含义以 **`python src/mtwi_ecommerce_pipeline.py --help`** 与 [agent.md](agent.md) 表格为准。
 
@@ -127,6 +147,7 @@ streamlit run streamlit_app.py
 - 默认 **http://localhost:8501**。
 - **局域网**：`streamlit run streamlit_app.py --server.address 0.0.0.0 --server.port 8501`，同网段访问 `http://<本机局域网 IP>:8501`。
 - 侧栏模型字段与「回退与审稿模型」展开项，与上列 `GMI_*` 及 CLI 一致。
+- **额外营销图**：主页面 **第 4 步「额外营销图（可选）」**（复选框 + 张数），不在侧栏；默认不生成。
 
 ## 命令行与批量
 

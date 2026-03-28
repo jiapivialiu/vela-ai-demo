@@ -2,11 +2,12 @@
 """Smoke-test: Request Queue marketing extras only (no Chat / no full pipeline).
 
 Use to smoke-test ``generate_additional_product_images`` only (no Chat), e.g. after switching RQ image models.
+To **merge into an existing deliverable folder** (manifest + ``product_image_extra_*.png``), use ``src/run_marketing_extras_step.py`` instead.
 
 Run from repo root::
 
     python src/try_additional_images_only.py \\
-      --reference-image outputs/mtwi_images_demo_one/demo_item_final.png \\
+      --reference-image demo_outputs/mtwi_images_demo_one/demo_item_final.png \\
       --model seedream-5.0-lite
 
 Full demo with **different** models for erase vs extras (optional)::
@@ -49,13 +50,18 @@ def main() -> None:
     parser.add_argument(
         "--reference-image",
         type=Path,
-        default=Path("outputs/mtwi_images_demo_one/demo_item_final.png"),
+        default=Path("demo_outputs/mtwi_images_demo_one/demo_item_final.png"),
         help="Cleaned main image (e.g. demo_item_final.png).",
     )
     parser.add_argument(
         "--model",
         default=os.getenv("GMI_ADDITIONAL_IMAGE_MODEL", "seedream-5.0-lite"),
         help="Request Queue model_id for variants (default: env GMI_ADDITIONAL_IMAGE_MODEL or seedream-5.0-lite).",
+    )
+    parser.add_argument(
+        "--fallback-model",
+        default=(os.getenv("GMI_FALLBACK_IMAGE_MODEL") or "").strip(),
+        help="Optional second RQ model if primary returns empty (env GMI_FALLBACK_IMAGE_MODEL).",
     )
     parser.add_argument("--out-dir", type=Path, default=Path("outputs/mtwi_images_extra_smoke"))
     parser.add_argument("--count", type=int, default=3)
@@ -86,6 +92,7 @@ def main() -> None:
         scenario_offset=0,
         first_file_index=1,
         warnings=warn,
+        fallback_model=args.fallback_model or None,
     )
     for w in warn:
         print(w, file=sys.stderr)
@@ -94,8 +101,9 @@ def main() -> None:
         print(line)
     if not paths and not args.mock:
         print(
-            "Hint: 0 files — RQ returned no usable image. Try GMI_EXTRA_IMAGES_PLACEHOLDER=1 to copy the reference, "
-            "or GMI_EXTRA_IMAGES_BATCH=1, or confirm model_id / outcome schema in GMI console.",
+            "Hint: 0 files — RQ returned no usable image. Try --fallback-model / GMI_FALLBACK_IMAGE_MODEL, "
+            "GMI_EXTRA_IMAGES_USE_EDIT_FALLBACK=1, GMI_EXTRA_IMAGES_MAX_PARALLEL=1, GMI_RQ_OUTCOME_DEBUG=1, "
+            "or GMI_EXTRA_IMAGES_PLACEHOLDER=1 only if you accept reference copies for missing slots.",
             file=sys.stderr,
         )
 

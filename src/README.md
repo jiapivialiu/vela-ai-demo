@@ -9,8 +9,10 @@
 | `src/mtwi_ecommerce_pipeline.py` | 主链路 CLI |
 | `src/run_bulk_pipeline.py` | 批量：pipeline → deliverables → 双评估 |
 | `src/eval_image_quality.py` / `eval_copy_quality.py` | 评估（可单独运行） |
-| `src/run_one_deliverable_example.sh` | 单商品示例（`data/demo_one/` → `outputs/deliverables_demo_one/`；可选 `GMI_DEMO_MODEL_PROFILE=openai_alt`） |
-| `src/try_additional_images_only.py` | **仅 RQ 扩展图**试跑（不调 Chat）；例：`python src/try_additional_images_only.py --model seedream-5.0-lite` |
+| `src/run_one_deliverable_example.sh` | 单商品示例（`data/demo_one/` → **`demo_outputs/deliverables_demo_one/`**；可用 **`DEMO_OUTPUT_ROOT`** 改根目录；**不含**主链路扩展图；可选 `GMI_DEMO_MODEL_PROFILE=openai_alt`） |
+| `src/run_marketing_extras_step.py` | **第二步**：仅 RQ 营销扩展图，写入已有交付目录（`--reference-image` = `*_final.png`）；与主链路输入格式隔离 |
+| `src/try_additional_images_only.py` | **仅 RQ 扩展图**试跑（不调 Chat、不写交付包）；粗测模型时用 |
+| `src/auto_text_erase_preprocess.py` | **无 MTWI** 批量去字：PaddleOCR + RQ（`seedream-5.0-lite`）+ 可选 harmonize（`bria-fibo-edit`）；`--mock` / `--quads-json` / `--resume` |
 | `configs/bulk_run.yaml` / `bulk_run_smoke.yaml` | 批量配置（生产 / mock 冒烟） |
 | 根目录 `streamlit_app.py` | Web UI（说明见根 README） |
 
@@ -40,6 +42,16 @@ bash src/run_one_deliverable_example.sh
 # GMI_DEMO_MODEL_PROFILE=openai_alt bash src/run_one_deliverable_example.sh
 ```
 
+主链路**不含**营销扩展图。需要 `product_image_extra_*.png` 时在交付目录生成后执行（示例路径按你仓库产物调整）：
+
+```bash
+python src/run_marketing_extras_step.py \
+  --reference-image demo_outputs/mtwi_images_demo_one/demo_item_final.png \
+  --deliverable-dir demo_outputs/deliverables_demo_one \
+  --product-id demo_item \
+  --count 3
+```
+
 ## 主脚本（调参 / 自定义数据路径）
 
 ```bash
@@ -48,13 +60,13 @@ python src/mtwi_ecommerce_pipeline.py --help
 python src/mtwi_ecommerce_pipeline.py --limit 3 \
   --erase-strategy model --quality-strategy local \
   --no-harmonize-after-erase --disable-restore \
-  --mask-mode all --additional-image-count 3 \
+  --mask-mode all --generate-additional-images --additional-image-count 3 \
   --vision-model "Qwen/Qwen3-VL-235B" \
   --english-copy-model "openai/gpt-5.4-pro" \
   --french-copy-model "anthropic/claude-sonnet-4.6" \
   --fallback-english-copy-model "openai/gpt-5.4-mini" \
   --fallback-french-copy-model "openai/gpt-5.4-mini" \
-  --copy-review-english-model "openai/gpt-5.4" \
+  --copy-review-english-model "anthropic/claude-sonnet-4.6" \
   --copy-review-french-model "anthropic/claude-sonnet-4.6" \
   --locale-grammar-english-model "openai/gpt-5.4-nano" \
   --locale-grammar-french-model "openai/gpt-5.4-nano" \
@@ -99,7 +111,7 @@ python src/run_bulk_pipeline.py --config configs/bulk_run.yaml
 
 - **聚合 YAML**：单次默认 `outputs/mtwi_ecommerce_samples.yaml`；批量在对应 `run_id` 目录下。
 - **交付包**：每商品子目录含 `product_image.png`、`description_en.md`、`description_fr.md`、`manifest.json`，可选 `product_image_extra_*.png`；根目录 `deliverables_index.csv` 含 `copy_review_md`、`locale_grammar_md`。
-- **文案 LLM 质检（必选，4b）**：英文 `--copy-review-english-model`（默认 `openai/gpt-5.4`）、法文 `--copy-review-french-model`（默认 `anthropic/claude-sonnet-4.6`）；各一次视觉 + JSON，结果合并进 `manifest.json` 的 `copy_review` 与 **`copy_review.md`**。稳定性：`step4b_copy_review_failed`、`copy_review_fail`、`copy_review_revise`。
+- **文案 LLM 质检（必选，4b）**：英 / 法 `--copy-review-english-model` / `--copy-review-french-model`（**默认均为** `anthropic/claude-sonnet-4.6`，同一套多模态 + JSON 调用）；各一次视觉 + JSON，结果合并进 `manifest.json` 的 `copy_review` 与 **`copy_review.md`**。稳定性：`step4b_copy_review_failed`、`copy_review_fail`、`copy_review_revise`。
 - **加拿大英语 + 加拿大法语语法质检（必选，4c）**：`--locale-grammar-english-model` / `--locale-grammar-french-model`（默认均为 `openai/gpt-5.4-nano`）。`locale_grammar_review`、**`locale_grammar_review.md`**、索引列 `locale_grammar_md`。稳定性：`step4c_locale_grammar_failed`、`locale_grammar_fail`、`locale_grammar_revise`。
 
 ## 单独跑评估

@@ -25,7 +25,7 @@ pipeline:
   french_copy_model: anthropic/claude-sonnet-4.6
   fallback_english_copy_model: openai/gpt-5.4-mini
   fallback_french_copy_model: openai/gpt-5.4-mini
-  copy_review_english_model: openai/gpt-5.4
+  copy_review_english_model: anthropic/claude-sonnet-4.6
   copy_review_french_model: anthropic/claude-sonnet-4.6
   locale_grammar_english_model: openai/gpt-5.4-nano
   locale_grammar_french_model: openai/gpt-5.4-nano

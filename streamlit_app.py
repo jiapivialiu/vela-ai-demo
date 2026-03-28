@@ -1,6 +1,23 @@
 """Streamlit UI: upload MTWI image + annotations, run ecommerce pipeline, preview deliverables.
 
-See README.md for venv / API key. Outputs go under outputs/streamlit_runs/<run_id>/.
+Flow (see ``main()``):
+
+1. User uploads image + MTWI ``.txt`` (or pastes lines); optional sidebar models / Mock.
+2. ``_write_run_inputs`` writes ``<run_dir>/image_train/streamlit_item.<ext>`` and
+   ``txt_train/streamlit_item.txt`` so ``collect_input_items`` directory-scan finds one SKU.
+3. ``_build_streamlit_pipeline_argv`` returns **option-only** tokens for
+   ``mtwi_ecommerce_pipeline.parse_args`` — **no** synthetic ``argv[0]`` program name.
+   (``argparse.parse_args(list)`` parses the whole list as flags; a leading
+   ``"mtwi_ecommerce_pipeline"`` token causes *unrecognized arguments* / ``SystemExit(2)``.)
+4. ``_run_pipeline_in_thread`` sets ``GMI_API_KEY`` (if provided), appends
+   ``--pipeline-progress-file``, then ``parse_args`` + ``run_pipeline``.
+5. After the form and **开始处理** button, the UI renders **运行进度（实时）** near the bottom
+   (polls ``pipeline_progress.jsonl`` until ``holder["done"]``), then on the next rerun **运行结果**
+   (success / errors / deliverables) **below** the form and progress — not above the inputs.
+
+Outputs: ``outputs/streamlit_runs/<run_id>/`` (images, yaml, deliverables, JSONL progress).
+
+See README.md for venv / API key.
 """
 
 from __future__ import annotations
@@ -8,6 +25,8 @@ from __future__ import annotations
 import io
 import os
 import sys
+import threading
+import time
 import traceback
 import uuid
 import zipfile
@@ -21,8 +40,9 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from mtwi_ecommerce_pipeline import parse_args, run_pipeline  # noqa: E402
+from pipeline_progress import format_progress_lines_for_ui, read_progress_tail  # noqa: E402
 
-_PIPELINE_JOB_KEY = "_streamlit_pipeline_job"
+_PIPELINE_ASYNC_KEY = "_streamlit_pipeline_async"
 _PIPELINE_RESULT_KEY = "_streamlit_pipeline_result"
 
 
@@ -38,7 +58,7 @@ def _write_run_inputs(image_bytes: bytes, image_suffix: str, annotation_text: st
     (txt_dir / f"{stem}.txt").write_text(annotation_text.strip() + "\n", encoding="utf-8")
 
 
-def _build_argv(
+def _build_streamlit_pipeline_argv(
     run_dir: Path,
     mock: bool,
     extra_count: int,
@@ -68,11 +88,11 @@ def _build_argv(
     copy_understand_image: str,
     skip_listing_review: bool = False,
 ) -> list[str]:
+    """CLI tokens for ``parse_args`` only — first element must be ``--...``, not a program name."""
     img_out = run_dir / "mtwi_images"
     yaml_out = run_dir / "artifacts.yaml"
     deliv = run_dir / "deliverables"
-    argv = [
-        "mtwi_ecommerce_pipeline",
+    argv: list[str] = [
         "--txt-dir",
         str(run_dir / "txt_train"),
         "--image-dir",
@@ -128,6 +148,7 @@ def _build_argv(
     if extra_count <= 0:
         argv.append("--no-generate-additional-images")
     else:
+        argv.append("--generate-additional-images")
         argv.extend(["--additional-image-count", str(int(extra_count))])
     if not harmonize:
         argv.append("--no-harmonize-after-erase")
@@ -155,25 +176,50 @@ def _restore_gmi_key_after_run(prev_key: str | None, session_api_key: str) -> No
         os.environ.pop("GMI_API_KEY", None)
 
 
-def _execute_pipeline_job(job: dict) -> None:
-    """Run parse_args + run_pipeline; set ``_pipeline_result`` for next frame."""
-    argv = job["argv"]
+def _run_pipeline_in_thread(holder: dict, job: dict) -> None:
+    """Background worker: writes JSONL to run_dir/pipeline_progress.jsonl; sets holder when done."""
+    argv = list(job["argv"])
     run_dir = Path(job["run_dir"])
+    progress_file = run_dir / "pipeline_progress.jsonl"
+    if "--pipeline-progress-file" not in argv:
+        argv.extend(["--pipeline-progress-file", str(progress_file)])
     prev_key = job.get("prev_key")
     session_api_key = str(job.get("session_api_key") or "")
     mock = bool(job.get("mock"))
+    holder["run_dir"] = str(run_dir)
     try:
         if session_api_key.strip():
             os.environ["GMI_API_KEY"] = session_api_key.strip()
         elif mock:
             os.environ.pop("GMI_API_KEY", None)
+        os.environ["GMI_PIPELINE_PROGRESS_FILE"] = str(progress_file)
         args = parse_args(argv)
         run_pipeline(args)
-        st.session_state[_PIPELINE_RESULT_KEY] = {"ok": True, "run_dir": str(run_dir)}
-    except Exception:
-        st.session_state[_PIPELINE_RESULT_KEY] = {"ok": False, "error": traceback.format_exc()}
+        holder["ok"] = True
+        holder["error"] = None
+    except SystemExit as exc:
+        # argparse uses SystemExit; it is not a subclass of Exception.
+        holder["ok"] = False
+        holder["error"] = f"parse_args 退出: code={getattr(exc, 'code', exc)!r}\n{traceback.format_exc()}"
+    except BaseException as exc:
+        holder["ok"] = False
+        tb = traceback.format_exc()
+        holder["error"] = tb if tb.strip() else f"{type(exc).__name__}: {exc}"
     finally:
+        if not holder.get("error") and holder.get("ok") is not True:
+            holder["ok"] = False
+            holder["error"] = (
+                "流水线异常结束但未记录详情（请查看运行该 Streamlit 的终端 stderr，"
+                f"或 {run_dir / 'streamlit_pipeline_error.txt'}）。"
+            )
+        if holder.get("ok") is not True and (holder.get("error") or "").strip():
+            err_path = run_dir / "streamlit_pipeline_error.txt"
+            try:
+                err_path.write_text(str(holder.get("error") or ""), encoding="utf-8")
+            except OSError:
+                pass
         _restore_gmi_key_after_run(prev_key, session_api_key)
+        holder["done"] = True
 
 
 def _render_deliverables(run_dir: Path) -> None:
@@ -222,13 +268,15 @@ def _render_deliverables(run_dir: Path) -> None:
 def main() -> None:
     st.set_page_config(page_title="Vela AI Demo — MTWI 链路", layout="wide")
     st.title("MTWI 商品图 → 去字 / 文案 / 交付包")
-    st.caption("中文标注输入；用户可见文案为加拿大英语 / 法语。侧栏可切换 Mock、模型与 **额外营销图数量**（默认 3 张）。")
+    st.caption(
+        "中文标注输入；用户可见文案为加拿大英语 / 法语。侧栏可切换 Mock、模型；**额外营销图**见下方 **第 4 步**（默认不生成；亦可跑完后用 `src/run_marketing_extras_step.py` 补图）。"
+    )
 
     with st.sidebar:
         st.header("运行模式")
         mock = st.checkbox("Mock 模式（不调 GMI）", value=False)
         api_key = st.text_input("GMI API Key（可选，覆盖环境变量）", type="password", value="")
-        st.header("图像与扩展图")
+        st.header("图像与去字")
         mask_mode = st.selectbox(
             "Mask 模式（txt 四边形 → 蒙版擦除）",
             ["all", "overlay"],
@@ -242,19 +290,11 @@ def main() -> None:
             help="Mock 下自动跳过。关闭则仅用 Mask 模式（all/overlay）选框。",
         )
         disable_restore = st.checkbox("跳过 step2 画质修复", value=False)
-        extra_image_count = st.number_input(
-            "额外营销图数量（0 = 不生成）",
-            min_value=0,
-            max_value=6,
-            value=3,
-            step=1,
-            help="对应 CLI：`--additional-image-count`；0 时等价于 `--no-generate-additional-images`。",
-        )
         erase_strategy = st.selectbox(
             "去字方式",
             ["model", "local"],
             index=0,
-            help="model = 与下方扩展图同一套 Request Queue 模型（默认）；local = 本地白底+inpaint，不调去字 RQ。",
+            help="model = 侧栏「RQ 去字模型」的 Request Queue（默认）；local = 本地白底+inpaint，不调去字 RQ。",
         )
         copy_understand_image = st.selectbox(
             "文案理解用图（Step3，在生成英法描述前）",
@@ -263,8 +303,9 @@ def main() -> None:
             help="final=修复后主图（默认，避开水印原图）；extra1=先出第1张营销图并经与原图一致性审核后再理解；source=原始上架图。",
         )
         additional_image_model = st.text_input(
-            "扩展图 / 去字模型（model 模式共用）",
+            "RQ 去字模型（erase=model 时）",
             value=os.getenv("GMI_ADDITIONAL_IMAGE_MODEL", "seedream-5.0-lite"),
+            help="与主表单「第 4 步」开启额外营销图时使用的扩展图模型相同（`--additional-image-model` / `--eraser-model`）。",
         )
         st.header("文案")
         copy_mode = st.selectbox("Step4 模式", ["unified", "split"], index=0)
@@ -273,7 +314,13 @@ def main() -> None:
             value=False,
             help="不调 copy review / locale grammar；交付包不含 copy_review.md 与 locale_grammar_review.md。",
         )
-        max_attempts = st.number_input("每步最大重试", min_value=1, max_value=5, value=2)
+        max_attempts = st.number_input(
+            "每步最大重试",
+            min_value=1,
+            max_value=2,
+            value=2,
+            help="与 CLI 一致：`mtwi_ecommerce_pipeline` 会将该值限制在 1–2。",
+        )
 
         with st.expander("模型 ID（高级）"):
             vision_model = st.text_input("VLM", value=os.getenv("GMI_VISION_MODEL", "Qwen/Qwen3-VL-235B"))
@@ -298,7 +345,10 @@ def main() -> None:
                 or os.getenv("GMI_FALLBACK_ENGLISH_COPY_MODEL", "openai/gpt-5.4-mini"),
             )
             no_simple_recovery = st.checkbox("关闭 simple bilingual recovery", value=False)
-            cr_en = st.text_input("Copy review EN", value=os.getenv("GMI_COPY_REVIEW_ENGLISH_MODEL", "openai/gpt-5.4"))
+            cr_en = st.text_input(
+                "Copy review EN",
+                value=os.getenv("GMI_COPY_REVIEW_ENGLISH_MODEL", "anthropic/claude-sonnet-4.6"),
+            )
             cr_fr = st.text_input(
                 "Copy review FR", value=os.getenv("GMI_COPY_REVIEW_FRENCH_MODEL", "anthropic/claude-sonnet-4.6")
             )
@@ -308,14 +358,6 @@ def main() -> None:
             lg_fr = st.text_input(
                 "Locale grammar FR", value=os.getenv("GMI_LOCALE_GRAMMAR_FRENCH_MODEL", "openai/gpt-5.4-nano")
             )
-
-    if _PIPELINE_RESULT_KEY in st.session_state:
-        pr = st.session_state.pop(_PIPELINE_RESULT_KEY)
-        if pr.get("ok") and pr.get("run_dir"):
-            st.success(f"完成。运行目录：`{pr['run_dir']}`")
-            _render_deliverables(Path(pr["run_dir"]))
-        else:
-            st.error(pr.get("error") or "流水线执行失败。")
 
     st.subheader("1. 商品主图")
     up_img = st.file_uploader("上传图片（PNG / JPG / WebP）", type=["png", "jpg", "jpeg", "webp"])
@@ -330,23 +372,33 @@ def main() -> None:
     user_copy = st.text_area("对 listing 文案的要求", height=80, placeholder="语气、长度、受众…")
     user_image = st.text_area("对图像处理 / 扩展图的要求", height=80, placeholder="背景、光线…")
 
-    processing = _PIPELINE_JOB_KEY in st.session_state
-
-    if processing:
-        st.warning("**正在处理中** — 「开始处理」已禁用；请勿关闭页面，完成后会自动刷新并展示结果。")
-
-    start_clicked = st.button(
-        "开始处理",
-        type="primary",
-        disabled=processing,
-        help="运行期间按钮会禁用，并显示「正在处理中」提示。",
+    st.subheader("4. 额外营销图（可选）")
+    st.caption(
+        "默认不生成。开启后会在本轮流水线内调用 Request Queue 产出 `product_image_extra_*.png`（耗时与费用更高）。"
+        " 若只需主图与文案，可保持关闭，完成后在终端运行 `python src/run_marketing_extras_step.py`（见 src/README.md）。"
     )
+    generate_extra_marketing = st.checkbox(
+        "在本轮运行中生成额外营销图",
+        value=False,
+        help="等价于 CLI：`--generate-additional-images` + `--additional-image-count`。",
+    )
+    extra_image_count = 0
+    if generate_extra_marketing:
+        extra_image_count = st.number_input(
+            "额外营销图张数",
+            min_value=1,
+            max_value=6,
+            value=3,
+            step=1,
+            help="写入交付目录的 `product_image_extra_1.png` … 序号连续。",
+        )
+
+    processing = _PIPELINE_ASYNC_KEY in st.session_state
 
     if processing:
-        job = st.session_state.pop(_PIPELINE_JOB_KEY)
-        with st.spinner("运行流水线：去字 → 理解与英法文案 → 质检 → 扩展图 → 交付包 …"):
-            _execute_pipeline_job(job)
-        st.rerun()
+        st.warning("**正在处理中** — 下方显示实时步骤。请勿关闭页面，完成后会自动刷新。")
+
+    start_clicked = st.button("开始处理", type="primary", disabled=processing)
 
     if start_clicked:
         if not mock and not (api_key.strip() or os.getenv("GMI_API_KEY", "").strip()):
@@ -372,7 +424,7 @@ def main() -> None:
                     st.error(f"写入临时文件失败: {exc}")
                 else:
                     prev_key = os.environ.get("GMI_API_KEY")
-                    argv = _build_argv(
+                    argv = _build_streamlit_pipeline_argv(
                         run_dir,
                         mock=mock,
                         extra_count=int(extra_image_count),
@@ -402,14 +454,71 @@ def main() -> None:
                         copy_understand_image=copy_understand_image,
                         skip_listing_review=skip_listing_review,
                     )
-                    st.session_state[_PIPELINE_JOB_KEY] = {
-                        "argv": argv,
-                        "run_dir": str(run_dir),
-                        "prev_key": prev_key,
-                        "session_api_key": api_key.strip(),
-                        "mock": mock,
+                    st.session_state[_PIPELINE_ASYNC_KEY] = {
+                        "job": {
+                            "argv": argv,
+                            "run_dir": str(run_dir),
+                            "prev_key": prev_key,
+                            "session_api_key": api_key.strip(),
+                            "mock": mock,
+                        },
+                        "started": False,
                     }
                     st.rerun()
+
+    # 进度放在页面最下方，避免运行中时大块日志顶掉「主图 / 标注」输入区。
+    async_state = st.session_state.get(_PIPELINE_ASYNC_KEY)
+    if async_state is not None:
+        if not async_state.get("started"):
+            holder: dict = {"done": False, "ok": None, "error": None, "run_dir": None}
+            job = async_state["job"]
+            thread = threading.Thread(target=_run_pipeline_in_thread, args=(holder, job), daemon=True)
+            thread.start()
+            async_state["holder"] = holder
+            async_state["started"] = True
+            async_state["_thread"] = thread
+        h = async_state["holder"]
+        run_dir_p = Path(async_state["job"]["run_dir"])
+        prog_path = run_dir_p / "pipeline_progress.jsonl"
+        st.subheader("运行进度（实时）")
+        st.caption("每条为一步的开始/结束；含本地时间、调用模型与阶段耗时。详见运行目录下 `pipeline_progress.jsonl`。")
+        raw_lines = read_progress_tail(prog_path, max_lines=50)
+        display = format_progress_lines_for_ui(raw_lines)
+        st.text_area(
+            "步骤与模型",
+            value=display if display.strip() else ("等待流水线写入进度…" if not h.get("done") else "（无进度记录）"),
+            height=300,
+            disabled=True,
+        )
+        if not h.get("done"):
+            time.sleep(0.35)
+            st.rerun()
+        else:
+            st.session_state[_PIPELINE_RESULT_KEY] = {
+                "ok": bool(h.get("ok")),
+                "run_dir": h.get("run_dir") or str(run_dir_p),
+                "error": h.get("error"),
+            }
+            del st.session_state[_PIPELINE_ASYNC_KEY]
+            st.rerun()
+
+    # 运行结果放在表单与进度**之后**，避免完成后 rerun 时整块预览出现在页面最上方。
+    if _PIPELINE_RESULT_KEY in st.session_state:
+        st.divider()
+        st.subheader("运行结果")
+        pr = st.session_state.pop(_PIPELINE_RESULT_KEY)
+        if pr.get("ok") and pr.get("run_dir"):
+            st.success(f"完成。运行目录：`{pr['run_dir']}`")
+            _render_deliverables(Path(pr["run_dir"]))
+        else:
+            err = (pr.get("error") or "").strip() or "流水线执行失败（无错误详情）。"
+            run_dir_msg = pr.get("run_dir") or ""
+            st.error(f"{err[:800]}{'…' if len(err) > 800 else ''}")
+            if run_dir_msg:
+                st.caption(f"运行目录：`{run_dir_msg}` — 失败时可能含 `streamlit_pipeline_error.txt` 与 `pipeline_progress.jsonl`。")
+            if len(err) > 400 or "\n" in err:
+                with st.expander("完整错误 / Full traceback", expanded=True):
+                    st.code(err, language="text")
 
 
 if __name__ == "__main__":

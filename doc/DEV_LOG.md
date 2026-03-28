@@ -2,6 +2,57 @@
 
 Brief record of what changed and what was verified to work. _(Previously under `misc/`; consolidated here in `doc/`.)_
 
+## 2026-03-29
+
+### Request Queue HTTP 超时（扩展图 / 去字）
+
+- **`RequestQueueClient.run_model`**：`POST /requests` 不再固定 **`timeout=60`**；读超时默认随当次 **`timeout_s`**（与 **`GMI_IMAGE_TIMEOUT`** 一致的量级），避免大图提交时 **`ReadTimeout: read timeout=60`**。可选 **`GMI_RQ_HTTP_SUBMIT_TIMEOUT`**、**`GMI_RQ_POLL_READ_TIMEOUT`** 等（见 **CONFIGURATION.md**）。
+
+### 文档 / 小一致性与启发式
+
+- **`CONFIGURATION.md`**：删除 **`GMI_EXTRA_IMAGES_PLACEHOLDER`** 下错误表述（`run_one_deliverable_example.sh` 曾默认 export `=1`）；与当前「主链路默认不跑扩展图」一致。
+- **启发式 `param_brand`**：去掉仅针对 **kangfu→KANGFU** 的写死大写，统一用结构化字段原值。
+- **Streamlit**：侧栏「每步最大重试」**上限改为 2**，与 `parse_args` clamp 一致。
+
+### Step4b 英文 copy review 默认模型
+
+- **`--copy-review-english-model`** 默认由 **`openai/gpt-5.4`** 改为与法侧一致 **`anthropic/claude-sonnet-4.6`**（同一 `_run_step4b_review_copy_one_language` 路径；仅 `model_id` 对齐）。`run_one_deliverable_example.sh` standard 档：`GMI_COPY_REVIEW_ENGLISH_MODEL` 未设时取 **`$GMI_COPY_REVIEW_FRENCH_MODEL`**。Bulk YAML / Streamlit / `run_bulk_pipeline` 回退默认已同步。
+
+### Step4c 语法审查（EN/FR）错误隔离
+
+- **`run_step4c_locale_grammar_review`**：与 Step4b 一致，**英 / 法各一次** `chat_json` 在子任务内 **try/except**；一侧 **HTTP 400** 等不再让整个 4c 抛错，也不会再把**同一条**异常复制进 `locale_grammar_review.md` 的两段。返回 **`(review_dict, any_side_failed)`**；`any_side_failed` 时写 **`step4c_locale_grammar_partial_failure`** 并计 **`step4c_locale_grammar_failed`**。
+
+### 测试目录与阶段产物
+
+- 新增 **`tests/`**：**`pytest.ini`**（`pythonpath=src tests`）、**`requirements-dev.txt`**（含 **pytest**）、**`test_pipeline_mock_smoke.py`**（临时目录内 mock 全链路 + `data/demo_one`）、**`test_extract_media_outcome.py`**、**`test_parse_args_embedded.py`**、**`test_stage_chain.py`**（依赖 **`python tests/generate_stage_artifacts.py`** 写入的 **`tests/stage_artifacts/generated/latest_manifest.json`**）。
+- **`tests/generate_stage_artifacts.py`**：mock 跑通并落盘 **`generated/<run_id>/`**，记录相对仓库根的 **`latest_manifest.json`**（`final_png`、`deliverable_product_dir` 等）供下一阶段测试复用。**`tests/stage_artifacts/generated/`** gitignore。
+- **`write_output`**：若 **`yaml` 模块无 `safe_dump`**（例如被本地 **`yaml.py`** 遮蔽），回退 **`.json`** 并依赖 **PyYAML** 说明。
+
+### 全自动去字预处理（无 MTWI）
+
+- 新增 **`src/auto_text_erase_preprocess.py`**：PaddleOCR 检测（默认置信度 ≥0.5）→ 多边形二值 mask（可选膨胀）→ 混合策略（单框面积均 &lt;500px 则 OpenCV inpaint，否则 **RQ** `seedream-5.0-lite` + mask）→ 可选 **`bria-fibo-edit`** 双图 harmonize（原图 + 去字图）。**ThreadPoolExecutor** 默认 4 线程、进度打印、**`--resume`** 跳过已有 `<stem>_final.png`、汇总 **`auto_erase_summary.csv`**。可选 **`--quads-json`**（`files` 按文件名映射）绕过 OCR。RQ：**2s** 轮询、超时默认 **30s**（**`GMI_AUTO_ERASE_RQ_TIMEOUT`**），入队重试 **`GMI_AUTO_ERASE_MAX_ATTEMPTS`**（默认 2，即失败后再试 1 次）。失败/降级在 meta CSV 中附带 **手动四角坐标** 备选说明。
+
+### 流水线实时进度（CLI stderr + JSONL + Streamlit）
+
+- 新增 **`src/pipeline_progress.py`**：`pipeline_progress_emit` / **`pipeline_progress_span`**；**stderr** 打印带**本地时间**的人类可读行；可选 **`GMI_PIPELINE_PROGRESS_FILE`** 或 **`--pipeline-progress-file`** 追加 **JSONL**（供 UI 轮询）。
+- **`run_pipeline`** 对 **annotation_audit、step1_erase、harmonize、restore、extra1_pregen、listing_reference_audit、step3_vision、step4_listing、step4b/4c、step5_extras、write_output、export** 等打点；**`eval_image_quality` / `eval_copy_quality`** 增加每样本一行与汇总 **mean**。
+- **`streamlit_app.py`**：流水线在**后台线程**运行，主界面 **`~0.35s` 轮询** `pipeline_progress.jsonl` 刷新 **text_area**；完成后写入结果并展示交付物。
+- **Streamlit 失败可见性**：后台线程 **`except SystemExit`**（`argparse` 非法参数）与 **`except BaseException`**，避免仅 **`Exception`** 时 `ok`/`error` 为空导致界面只显示泛化「流水线执行失败」；失败时写入运行目录 **`streamlit_pipeline_error.txt`**；界面 **`st.expander` 展示完整 traceback**。
+- **Streamlit 结果区位置**：`_PIPELINE_RESULT_KEY` 的交付预览从页顶移到 **「开始处理」+ 进度块之后**，用 **分隔线 +「运行结果」** 标题，避免完成后 rerun 时预览出现在最上方。
+- **Streamlit `parse_args` 根因修复**：嵌入调用时传给 **`ArgumentParser.parse_args(list)`** 的列表**不会**像 shell 一样去掉 `argv[0]`；原先 `_build_argv` 首项为 **`mtwi_ecommerce_pipeline`** 会触发 **`unrecognized arguments` / SystemExit(2)**。现 **`_build_streamlit_pipeline_argv`** 仅含 **`--...` 选项**；**`parse_args`** 内 **`_normalize_embedded_argv`** 会剥掉**一个**不以 `-` 开头的首 token（兼容旧调用）。
+
+### RQ outcome 解析（扩展图 / 图像变体）
+
+- **`extract_media_bytes_from_outcome` / `extract_all_media_bytes_from_outcome`**：支持顶层 **`data` / `content` 字符串**（data-URL 或裸 base64）；**`result`/`data`/… 包裹键**下 **`str`**；列表键增加 **`files` / `media` / `items`**；**`media_urls` 项**中 **`data` 为字符串**时解码；**`extract_all`** 对每个 **`media_urls` dict 项**再调 **`extract_media_bytes_from_outcome`** 兜底。
+- **`run_image_variants`**：`media_urls` 首遍对每个 **dict 项**直接 **`extract_media_bytes_from_outcome(item)`**，与全 outcome 解析对齐。
+- **`GMI_RQ_OUTCOME_DEBUG_DEEP`**：嵌套约 **3 层**的 key 树（截断长串）；**`GMI_RQ_OUTCOME_DEBUG`** 文档改为明确「仅顶层摘要，非完整 JSON」。
+
+### 营销扩展图（RQ）降级与解析
+
+- **`extract_all_media_bytes_from_outcome`**：从 RQ outcome 收集多图字节（含 **`media_urls[].data.url`**、常见 list 键、递归 `result`/`data`），去重后补全 **`run_image_variants`** 短读。
+- **`_extra_marketing_fetch_bytes`**：默认 **仅路径 1**（**`run_image_variants`** 主模型 → 可选 fallback）；**`run_image_edit`（路径 2）** 需 **`GMI_EXTRA_IMAGES_USE_EDIT_FALLBACK=1`**，Seedream 另需 **`GMI_EXTRA_IMAGES_SEEDREAM_USE_EDIT_FALLBACK=1`**。异常写入 **`extra_images_rq_*_failed`**。**Seedream generic backfill** 默认 **2** 轮（**`GMI_EXTRA_IMAGES_SEEDREAM_BACKFILL_CAP`**）。**丢弃与参考文件字节完全相同的输出**。**`GMI_EXTRA_IMAGES_MAX_PARALLEL`**（默认 1，上限 8）可并行 per-shot。
+- **占位复制**：仍为 **显式 `GMI_EXTRA_IMAGES_PLACEHOLDER=1`** 才用参考图填洞；未设置则 **少文件 + warnings**。Bulk YAML：**`pipeline.fallback_additional_image_model`** → CLI。`try_additional_images_only.py`：**`--fallback-model`**。
+
 ## 2026-03-28
 
 ### RQ 图像 outcome 解析与调试
@@ -16,14 +67,19 @@ Brief record of what changed and what was verified to work. _(Previously under `
 ### Extra-image prompts (less “match reference framing” pressure)
 
 - **`generate_additional_product_images` `base_identity`**：强调参考图为 **identity anchor**，鼓励 **机位/光/景** 明显变化以做营销多样性；去掉易被判读成「不要偏离参考构图」的 duplicate-packshot 句式。**VARIANT 1** 允许极简棚内置景（亚克力台、轻微布面等）与不同光型，避免模型过度「安全」导致与 final 过于接近。
+- **营销扩展图 prompt（物理合理性）**：`base_identity` 增加 **Physical realism** 段（正确用法、稳定摆放、避免竖立平衡奇迹、线材重力等）；**VARIANT 1/2/3** 与 **backfill** 补充台面/手持/吹风机吹发等示例约束；batch 多图提示同步一句。
+- **营销扩展图 VARIANT 3 / `product_type` 上下文**：强化 **人–货互动**（作用部位、朝向、握法）；**不写具体品类举例**以保持通用性，仅原则性描述；`product_type` 行只强调与标签一致的典型真实用法。
+- **营销扩展图 — 朝向**：`base_identity` + **VARIANT 3** 增加 **Directional handheld tools / Orientation check**：**输出端朝向使用目标**，禁止 **进风/尾部抵住头发或皮肤而喷口朝外** 的反向持握；拇指与按键布局与参考图 SKU 一致。
+- **营销扩展图 — 松弛感**：在保留朝向/反向禁止的前提下，强调 **relaxed、candid、mid-motion OK**，弱化 **mandatory / 多条 Do not** 与僵硬的 orientation 分段，避免人货互动过于板正。
+- **营销扩展图 — 身體向商品**：`base_identity` 增加 **Body-directed products**（作用于使用者身体/佩戴时：目标部位、接近角、距离、使用方式一致）；**VARIANT 3** 与 **product_type**、batch 总述同步强调 **angle / mode of use**，与松弛语气并存。
 
 ### 仅 RQ 扩展图试跑脚本
 
-- **`src/try_additional_images_only.py`**：只调 **`generate_additional_product_images`**，不调 Chat；默认参考图 `outputs/mtwi_images_demo_one/demo_item_final.png`，默认模型 env 或 **`seedream-5.0-lite`**。全链路若只换扩展图模型：同时设 **`GMI_ERASER_MODEL`**（保持去字）与 **`GMI_ADDITIONAL_IMAGE_MODEL`**（扩展图）。
+- **`src/try_additional_images_only.py`**：只调 **`generate_additional_product_images`**，不调 Chat；默认参考图 **`demo_outputs/mtwi_images_demo_one/demo_item_final.png`**（与 **`run_one_deliverable_example.sh`** 的 **`DEMO_OUTPUT_ROOT`** 默认一致），默认模型 env 或 **`seedream-5.0-lite`**。全链路若只换扩展图模型：同时设 **`GMI_ERASER_MODEL`**（保持去字）与 **`GMI_ADDITIONAL_IMAGE_MODEL`**（扩展图）。
 
 ### Marketing extras RQ 调用方式
 
-- **`generate_additional_product_images`**：默认 **每张 `num_images=1` 变体**；可选 **`GMI_EXTRA_IMAGES_BATCH=1`** 先批量再补齐；若变体仍无 `media_urls`，默认 **`run_image_edit`** 按场景逐张补齐（**`GMI_EXTRA_IMAGES_USE_EDIT_FALLBACK`**，与 Step1 去字同路径，适配 Gemini 等）。「要了 N 张、实得不足」时写 **`extra_images_shortfall`**。
+- **`generate_additional_product_images`**：默认 **每张 `num_images=1` 变体（路径 1）**；可选 **`GMI_EXTRA_IMAGES_BATCH=1`** 先批量再补齐；**`run_image_edit`（路径 2）** 默认 **关**，需 **`GMI_EXTRA_IMAGES_USE_EDIT_FALLBACK=1`**（Seedream 另需 **`GMI_EXTRA_IMAGES_SEEDREAM_USE_EDIT_FALLBACK=1`**）。「要了 N 张、实得不足」时写 **`extra_images_shortfall`**。
 - **`extra_images_placeholder_note`**：占位复制 final 时追加说明 — 每张仍发过 **不同** VARIANT（**不同角度棚拍 / 换应用场景无人 / 有人在使用**）。**`GMI_EXTRA_IMAGES_DEBUG=1`**：warnings + stderr 记录各次 RQ 的 prompt 摘要与 **`returned_bytes`**。
 
 ### Dual-image Step4 + optional skip reviews
@@ -61,8 +117,8 @@ Brief record of what changed and what was verified to work. _(Previously under `
 - **Step1 local**：白 + `cv2.inpaint`；`GMI_LOCAL_INPAINT_RADIUS`；`opencv-python-headless` + `numpy`。
 - **标注审核**：`audit_mtwi_annotation_spans`；fallback 与 stability 字段；Streamlit / YAML。
 - **`--mask-mode`**：`all` 默认；overlay+mock 空启发式回退。
-- **Streamlit**：除摘要列出的侧栏项外，**额外营销图数量**（0–6，默认 3）→ `--additional-image-count` / `--no-generate-additional-images`。Mock 下可跑通 `demo_one` 交付（含 `product_image_extra_*`）。
-- **Extra marketing images default ON**: `parse_args` uses `parser.set_defaults(generate_additional_images=True)` + `--no-generate-additional-images`; bulk `build_pipeline_cmd` defaults `generate_additional_images` to **true**; `GMI_GENERATE_ADDITIONAL_IMAGES` env override. Three scenario prompts: alternate angle → lifestyle in-use → different background/usage scene.
+- **Streamlit**：主表单 **第 4 步「额外营销图（可选）」** — 复选框默认关；开启后选张数（1–6）→ `--generate-additional-images` + `--additional-image-count`。独立步骤：**`src/run_marketing_extras_step.py`**。
+- **Extra marketing images default OFF**: `parse_args` `set_defaults(generate_additional_images=False)`；`--generate-additional-images` 开启；`GMI_GENERATE_ADDITIONAL_IMAGES=1` 可强制开启。Bulk：`configs/bulk_run.yaml` 仍显式 `generate_additional_images: true` 时才会加 CLI 标志。三场景 prompt：角度 → 使用场景 → 背景/用法。
 - **Default Step4 = unified**: `GMI_COPY_GENERATION_MODE` / `--copy-generation-mode` default **`unified`**; **split** opt-in. `bulk_run*.yaml`, `run_bulk_pipeline`, `run_one_deliverable_example.sh`, `agent.md`, `CONFIGURATION.md` updated.
 - **`--unified-copy-model` default**: aligns with **`GMI_ENGLISH_COPY_MODEL`** / **`openai/gpt-5.4-pro`** (was mini); bulk YAML + `build_pipeline_cmd` fallback uses `english_copy_model`.
 - **`ChatClient.chat_json` / `parse_json_content`**: If the gateway returns 400 for `response_format: json_object`, retry the same call without it. Parse markdown-fenced JSON, leading prose, and `JSONDecoder.raw_decode` from the first `{`. Normalize `message.content` when it is a list of text parts (multimodal-style). Optional env `GMI_CHAT_JSON_RESPONSE_FORMAT` (`1` default vs `0` to skip json_object entirely); documented in `CONFIGURATION.md`.

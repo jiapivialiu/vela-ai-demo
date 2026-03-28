@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -162,21 +164,32 @@ def main() -> None:
     if not isinstance(samples, list):
         raise ValueError("Samples YAML must be a list")
 
-    rows = [evaluate_one(s, diff_threshold=args.threshold) for s in samples]
+    t_run = time.perf_counter()
+    print(f"[eval_image] start {datetime.now().astimezone().isoformat()}  samples={len(samples)}", flush=True)
+    rows = []
+    for s in samples:
+        pid = str(s.get("product_id", "?"))
+        t0 = time.perf_counter()
+        row = evaluate_one(s, diff_threshold=args.threshold)
+        dt = time.perf_counter() - t0
+        rows.append(row)
+        if "error" in row:
+            print(f"[eval_image] {pid}  {dt:.3f}s  ERROR {row['error']}", flush=True)
+        else:
+            print(
+                f"[eval_image] {pid}  {dt:.3f}s  quality={row['quality_score']:.3f}  "
+                f"removal={row['removal_score']:.3f}  preserve={row['preservation_score']:.3f}",
+                flush=True,
+            )
     write_csv(rows, Path(args.output_csv))
     write_markdown(rows, Path(args.output_md))
 
+    ok_scores = [float(r["quality_score"]) for r in rows if "error" not in r]
+    mean_q = sum(ok_scores) / len(ok_scores) if ok_scores else 0.0
+    total_dt = time.perf_counter() - t_run
+    print(f"[eval_image] done {datetime.now().astimezone().isoformat()}  total={total_dt:.2f}s  mean_quality={mean_q:.3f}", flush=True)
     print(f"Wrote metrics CSV: {args.output_csv}")
     print(f"Wrote metrics Markdown: {args.output_md}")
-    for r in rows:
-        if "error" in r:
-            print(f"- {r['product_id']}: ERROR ({r['error']})")
-        else:
-            print(
-                f"- {r['product_id']}: quality={r['quality_score']:.3f}, "
-                f"removal={r['removal_score']:.3f}, preserve={r['preservation_score']:.3f}, "
-                f"localize={r['edit_localization_score']:.3f}"
-            )
 
 
 if __name__ == "__main__":

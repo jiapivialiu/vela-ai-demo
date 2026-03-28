@@ -3,7 +3,7 @@
 Flow: optional **annotation audit** (VLM JSON per MTWI box: usable vs misaligned, needs processing) →
 text removal (local and/or Request Queue) → optional harmonize (seam blend) → quality (local and/or model) →
 vision (default Qwen/Qwen3-VL-235B; input image selectable: cleaned **final**, raw **source**, or audited **extra1**) → EN/FR copy (**dual image**: original listing + cleaned frame, plus Step3 JSON + full OCR; **unified** or **split** both use one bilingual structured call; fixed `param_*` keys) →
-optional simple bilingual recovery (split only) → Step4b/4c (optional **`--skip-listing-review`**; else EN/FR **parallel** each) → **marketing extras**: by default **one RQ call per image** (`num_images=1`); optional **`GMI_EXTRA_IMAGES_BATCH=1`** tries a single multi-image request first, then fills gaps.
+optional simple bilingual recovery (split only) → Step4b/4c (optional **`--skip-listing-review`**; else EN/FR **parallel** each) → **marketing extras** (**off** by default; enable with **`--generate-additional-images`**): **one RQ call per image** (`num_images=1`); optional **`GMI_EXTRA_IMAGES_BATCH=1`**; per slot **variants → optional fallback → edit** (see env docs); or run **`src/run_marketing_extras_step.py`** after the main job for the same RQ path only.
 
 See agent.md for model table and per-SKU chat call counts (~6 unified default, ~7 split); src/README.md for CLI/bulk; CONFIGURATION.md for GMI_* env vars.
 `--max-attempts` is capped at **2** (enqueue/chat retries). Run: `python src/mtwi_ecommerce_pipeline.py --help` or `src/run_one_deliverable_example.sh`.
@@ -20,13 +20,19 @@ import os
 import re
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
 
 import requests
+
+from pipeline_progress import (  # noqa: E402
+    pipeline_progress_emit,
+    pipeline_progress_init,
+    pipeline_progress_span,
+)
 
 try:
     from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageStat  # type: ignore
@@ -80,6 +86,30 @@ class EcommerceArtifact:
     user_image_instructions: str = ""
 
 
+def _rq_post_timeout_tuple(job_deadline_s: float) -> Tuple[float, float]:
+    """(connect, read) for Request Queue **submit** POST.
+
+    Large image payloads can exceed a naive 60s read timeout before the gateway returns
+    ``request_id``. ``read`` defaults to ``max(120, min(900, job_deadline_s))`` so it scales
+    with ``GMI_IMAGE_TIMEOUT`` / per-call ``timeout_s`` unless overridden.
+    """
+    conn = float((os.getenv("GMI_RQ_HTTP_CONNECT_TIMEOUT") or "30").strip() or "30")
+    raw = (os.getenv("GMI_RQ_HTTP_SUBMIT_TIMEOUT") or "").strip()
+    if raw:
+        read = float(raw)
+    else:
+        read = max(120.0, min(900.0, float(job_deadline_s)))
+    return (max(5.0, conn), max(30.0, read))
+
+
+def _rq_poll_timeout_tuple() -> Tuple[float, float]:
+    """(connect, read) for status polling GET."""
+    conn = float((os.getenv("GMI_RQ_POLL_CONNECT_TIMEOUT") or "15").strip() or "15")
+    raw = (os.getenv("GMI_RQ_POLL_READ_TIMEOUT") or "").strip()
+    read = float(raw) if raw else 90.0
+    return (max(5.0, conn), max(15.0, read))
+
+
 class RequestQueueClient:
     """Generic Request Queue client for BRIA-style image editing models."""
 
@@ -98,6 +128,7 @@ class RequestQueueClient:
 
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         enqueue_url = f"{self.base_url}/requests"
+        post_timeout = _rq_post_timeout_tuple(timeout_s)
         last_exc: Optional[Exception] = None
         for attempt in range(1, self.max_attempts + 1):
             try:
@@ -105,7 +136,7 @@ class RequestQueueClient:
                     enqueue_url,
                     headers=headers,
                     json={"model": model, "payload": payload},
-                    timeout=60,
+                    timeout=post_timeout,
                 )
                 resp.raise_for_status()
                 break
@@ -121,9 +152,10 @@ class RequestQueueClient:
             raise RuntimeError(f"Request Queue returned no request_id: {resp.text}")
 
         status_url = f"{self.base_url}/requests/{request_id}"
+        poll_timeout = _rq_poll_timeout_tuple()
         deadline = time.time() + timeout_s
         while time.time() < deadline:
-            poll = requests.get(status_url, headers=headers, timeout=30)
+            poll = requests.get(status_url, headers=headers, timeout=poll_timeout)
             poll.raise_for_status()
             data = poll.json()
             status = data.get("status")
@@ -199,23 +231,12 @@ class RequestQueueClient:
         media_urls = outcome.get("media_urls")
         if isinstance(media_urls, list):
             for item in media_urls:
+                if len(binaries) >= count:
+                    break
                 if isinstance(item, dict):
-                    u = None
-                    for kk in ("url", "uri", "href", "signed_url", "output_url", "image_url"):
-                        x = item.get(kk)
-                        if isinstance(x, str) and x.startswith("http"):
-                            u = x
-                            break
-                    if u:
-                        urls.append(u)
-                        continue
-                    for k in ("image", "image_base64", "base64", "data", "b64_json"):
-                        v = item.get(k)
-                        if isinstance(v, str):
-                            dec = _decode_inline_image_string(v)
-                            if dec:
-                                binaries.append(dec)
-                                break
+                    got = extract_media_bytes_from_outcome(item)
+                    if got:
+                        binaries.append(got)
                 elif isinstance(item, str):
                     if item.startswith("http"):
                         urls.append(item)
@@ -245,6 +266,16 @@ class RequestQueueClient:
             b = extract_media_bytes_from_outcome(outcome)
             if b:
                 binaries.append(b)
+        if len(binaries) < count:
+            seen_h = {hashlib.sha256(x).hexdigest() for x in binaries}
+            for raw in extract_all_media_bytes_from_outcome(outcome, max_n=count):
+                if len(binaries) >= count:
+                    break
+                h = hashlib.sha256(raw).hexdigest()
+                if h in seen_h:
+                    continue
+                seen_h.add(h)
+                binaries.append(raw)
         if not binaries:
             _log_rq_outcome_debug(f"run_image_variants({model})", outcome)
         return binaries[: max(1, count)]
@@ -977,6 +1008,123 @@ def run_step2_harmonize_model(
     return harmonized_path
 
 
+def _rq_model_id_has_seedream(model_id: str) -> bool:
+    return "seedream" in (model_id or "").lower()
+
+
+def _record_extra_marketing_exception(
+    exc: BaseException,
+    *,
+    stage: str,
+    model_id: str,
+    warn_tag: str,
+    warnings: Optional[List[str]],
+) -> None:
+    """Log RQ failures to stderr and ``warnings`` (manifest); avoids silent ``except: pass``."""
+    detail = str(exc).strip() or repr(exc)
+    if len(detail) > 480:
+        detail = detail[:477] + "..."
+    msg = f"extra_images_rq_{stage}_failed: tag={warn_tag} model={model_id!r} {type(exc).__name__}: {detail}"
+    print(msg, file=sys.stderr)
+    if warnings is not None:
+        warnings.append(msg)
+
+
+def _extra_marketing_effective_use_edit_fallback(primary_model: str, use_edit_fallback: bool) -> bool:
+    """Seedream-style IDs default to variants-only (closer to early pipeline); opt-in edit chain via env."""
+    if not use_edit_fallback:
+        return False
+    if not _rq_model_id_has_seedream(primary_model):
+        return True
+    force = (os.getenv("GMI_EXTRA_IMAGES_SEEDREAM_USE_EDIT_FALLBACK") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    return force
+
+
+def _extra_marketing_backfill_cap(primary_model: str) -> int:
+    """Fewer generic backfill rounds for Seedream (each round can cost full RQ timeouts)."""
+    if _rq_model_id_has_seedream(primary_model):
+        try:
+            return max(0, int((os.getenv("GMI_EXTRA_IMAGES_SEEDREAM_BACKFILL_CAP") or "2").strip()))
+        except ValueError:
+            return 2
+    return 6
+
+
+def _extra_marketing_fetch_bytes(
+    rq: RequestQueueClient,
+    source_for_generation: Path,
+    prompt: str,
+    primary_model: str,
+    fallback_model: Optional[str],
+    *,
+    use_edit_fallback: bool,
+    ref_bytes: bytes,
+    warnings: Optional[List[str]],
+    warn_tag: str,
+) -> Optional[bytes]:
+    """One slot: variants (primary → optional fallback model) then optional ``run_image_edit`` same order.
+
+    Drops outputs whose raw bytes equal the reference file (common RQ no-op) unless ``rq.mock``.
+    For model ids containing ``seedream``, ``run_image_edit`` is skipped unless
+    ``GMI_EXTRA_IMAGES_SEEDREAM_USE_EDIT_FALLBACK=1`` (see ``_extra_marketing_effective_use_edit_fallback``).
+    """
+    models: List[str] = [primary_model]
+    fb = (fallback_model or "").strip()
+    if fb and fb != primary_model:
+        models.append(fb)
+
+    use_edit = _extra_marketing_effective_use_edit_fallback(primary_model, use_edit_fallback)
+
+    def _accept(blob: Optional[bytes]) -> Optional[bytes]:
+        if not blob:
+            return None
+        if rq.mock:
+            return blob
+        if ref_bytes and blob == ref_bytes:
+            if warnings is not None:
+                warnings.append(f"extra_images_identical_to_reference_{warn_tag}")
+            return None
+        return blob
+
+    for m in models:
+        try:
+            one = rq.run_image_variants(
+                model=m,
+                reference_image=source_for_generation,
+                prompt=prompt,
+                count=1,
+            )
+            got = _accept(one[0] if one else None)
+            if got:
+                return got
+        except Exception as exc:
+            _record_extra_marketing_exception(
+                exc, stage="variants", model_id=m, warn_tag=warn_tag, warnings=warnings
+            )
+    if use_edit and not rq.mock:
+        for m in models:
+            try:
+                blob = rq.run_image_edit(
+                    model=m,
+                    source_image=source_for_generation,
+                    prompt=prompt,
+                    mask_image=None,
+                )
+                got = _accept(blob)
+                if got:
+                    return got
+            except Exception as exc:
+                _record_extra_marketing_exception(
+                    exc, stage="image_edit", model_id=m, warn_tag=warn_tag, warnings=warnings
+                )
+    return None
+
+
 def generate_additional_product_images(
     rq: RequestQueueClient,
     source_for_generation: Path,
@@ -989,6 +1137,7 @@ def generate_additional_product_images(
     scenario_offset: int = 0,
     first_file_index: int = 1,
     warnings: Optional[List[str]] = None,
+    fallback_model: Optional[str] = None,
 ) -> List[str]:
     """Generate additional images of the same product from repaired image.
 
@@ -999,10 +1148,23 @@ def generate_additional_product_images(
     Optional: set ``GMI_EXTRA_IMAGES_BATCH=1`` to try **one** batched call (``num_images=N`` + numbered briefs)
     first, then fill any shortfall with per-shot ``count=1`` calls.
 
-    Backfill: up to **6** extra single-image attempts with a generic angle prompt if still short.
+    Backfill: up to **6** generic-angle attempts for most models; **Seedream** ids (name contains ``seedream``) default
+    to **2** (``GMI_EXTRA_IMAGES_SEEDREAM_BACKFILL_CAP``).
 
-    If variants still return no bytes, **edit fallback** (default on): same model via ``run_image_edit``
-    (Step1-style payload) once per missing slot — set ``GMI_EXTRA_IMAGES_USE_EDIT_FALLBACK=0`` to disable.
+    Each slot uses **variants → optional fallback model** by default; **``run_image_edit``** second path is **off** unless
+    ``GMI_EXTRA_IMAGES_USE_EDIT_FALLBACK=1`` / ``true`` / ``on``.
+    **Seedream** ids still require **``GMI_EXTRA_IMAGES_SEEDREAM_USE_EDIT_FALLBACK=1``** in addition, to enable that edit path.
+    RQ errors are appended to ``warnings`` and printed to stderr.
+
+    Outputs identical to the reference file bytes are rejected (live mode) so we do not treat echo responses as success.
+
+    Optional ``fallback_model`` or env ``GMI_FALLBACK_IMAGE_MODEL``: second RQ model id if the primary returns empty.
+
+    Parallel per-shot requests: ``GMI_EXTRA_IMAGES_MAX_PARALLEL`` (default ``1`` = sequential; try ``2`` to speed up,
+    watch for rate limits).
+
+    Placeholder copy of the reference image is **opt-in** only: set ``GMI_EXTRA_IMAGES_PLACEHOLDER=1`` to fill
+    missing slots with the reference (legacy). Otherwise shortfall is reported via warnings + fewer files.
 
     ``scenario_offset`` skips the first N scenario lines (e.g. after extra_1 was already generated).
     ``first_file_index`` sets the starting suffix for ``*_extra_{n}.png`` filenames.
@@ -1024,10 +1186,30 @@ def generate_additional_product_images(
         "Rules: no readable text, watermarks, price tags, or UI overlays in the output. Do not swap in a different "
         "product category or unrelated object. Follow this request’s VARIANT role: (1) new angle / studio, "
         "(2) new real-world usage context without a visible person, (3) person clearly using the product.\n"
+        "**Physical realism:** Depict people and products **as in real life**, with a **relaxed, candid** feel when someone "
+        "appears — comfortable posture, natural arms and wrists, believable weight; **avoid** stiff mannequin or overly "
+        "rigid “catalog freeze” poses, while still showing **plausible** use. Infer **intended use** from the reference; "
+        "keep **contact / effect zone** and **orientation** believable (working end toward the real target, credible grip). "
+        "**Directional tools only:** if the reference clearly separates an **emitting / output end** from the **opposite "
+        "end** (intake, rear housing, etc.), do **not** reverse them — output must not point away while the wrong end "
+        "presses the target. "
+        "**Body-directed products (infer from reference):** if the item is meant to **act on the user** (contact, airflow, "
+        "light, vibration, application, or wear on head/face/hands/body — not only on external objects), the scene must "
+        "show **reasonable interaction**: correct **body region** as the intended target, **approach angle** and **distance** "
+        "that match how that product type is normally used, and a **coherent mode of use** (how it meets the body or directs "
+        "output toward it). Do not treat an unrelated body area as the main target while the product clearly targets "
+        "somewhere else. **No-people shots:** rest on surfaces naturally; avoid impossible balance. Cords and lighting follow "
+        "physics.\n"
     )
     context_bits: List[str] = []
     if product_type:
-        context_bits.append(f"Product category (for believable props and setting): {product_type}.")
+        context_bits.append(
+            f"Product category (for environment, props, and **person-in-use** poses): {product_type}. "
+            f"If someone appears, show a **relaxed, typical** moment of using a **{product_type}** — natural pose plus "
+            f"**plausible target body region or surface**, **orientation**, and **angle/distance** for real use (infer from "
+            f"the reference and this label; especially if the item acts **on the person**, keep interaction physically "
+            f"reasonable; not stiff staging)."
+        )
     if feature_text:
         context_bits.append(f"On-pack / listing cues (do not render as overlaid text): {feature_text}.")
     if user_image_instructions.strip():
@@ -1046,28 +1228,40 @@ def generate_additional_product_images(
             "slight top-down, or ~90° on-axis rotation). Studio or catalog look: white / pale-gray / soft-gradient sweep OK; "
             "optional minimal prop is fine (clear acrylic riser, subtle linen, soft shadow card) as long as it stays "
             "neutral and does not become a lifestyle room scene. No people, no hands. Lighting may differ from the reference "
-            "(harder key, softer wrap, or rim) to reinforce that this is a new shot, not a copy."
+            "(harder key, softer wrap, or rim) to reinforce that this is a new shot, not a copy. "
+            "**Placement:** product lies on or leans against a believable support (sweep, riser, cloth); if upright, use a "
+            "stable base or angle that matches how this **product type** is normally displayed — **not** a magic vertical "
+            "balance on a bare table."
         ),
         (
             "VARIANT 2 — DIFFERENT APPLICATION SCENARIO (IN-USE CONTEXT, NO VISIBLE PERSON): "
-            "This image is about switching the usage context: place the SAME product in a believable real-world application "
-            "environment for its category (bathroom counter, desk, gym bag nearby, kitchen shelf, travel surface — pick one "
-            "that fits the product type). Natural ambient light; background and props support “where you’d use it” but stay "
+            "This image is about switching the usage context: place the SAME product in a **believable real-world setting** "
+            "where this type of item would plausibly sit or be staged (infer from the reference; one coherent environment). "
+            "Natural ambient light; background and props support “where you’d use it” but stay "
             "softer than the hero product. Do not show a recognizable person, face, or full hands; at most an extremely "
-            "blurred partial wrist edge if unavoidable. Product must remain the sharp focal subject."
+            "blurred partial wrist edge if unavoidable. Product must remain the sharp focal subject. "
+            "**Placement:** on a **flat stable surface** (counter, shelf, open bag, tray) in a natural resting pose — "
+            "cord coiled or draped realistically if visible; **do not** show the item standing unsupported in an unstable "
+            "pose unless the product’s shape clearly supports a stable freestanding display."
         ),
         (
             "VARIANT 3 — PERSON IN USE (LIFESTYLE USAGE SCENE): "
-            "This image must show someone actually using or interacting with the product in a plausible everyday scenario "
-            "for this item type (holding, applying, operating, wearing as appropriate). One adult; natural pose. "
-            "Face may be turned away, cropped, or softly out of focus — emphasis on product + hands/body interaction. "
-            "Warm believable lighting; background softly blurred. Hands and fingers anatomically correct; product identity "
-            "must match the reference (same item, not a substitute)."
+            "**Mood:** **Relaxed, everyday lifestyle** — a candid moment (mid-motion OK), not a stiff symmetrical demo pose "
+            "or frozen mannequin. Comfortable shoulders, natural elbow/wrist angles, soft energy.\n"
+            "**Use logic:** one adult; setting fits the product’s domain (infer from reference). Show **primary intended use** "
+            "with **interaction that makes sense** — correct **who/what is being acted on** (body region, worn zone, or "
+            "external substrate as appropriate), **how the product meets or aims at that target**, and **viewing angle** "
+            "that still reads the action clearly. If the product **acts on the user**, prioritize **realistic angle of "
+            "approach** and **distance** for that mode of use (not decorative mis-aim). Match reference geometry: **functional "
+            "output / working end** toward the **real target**; **do not** reverse orientation (output away while the wrong "
+            "end touches the target). Hands rest naturally on grips; controls plausible for **this** SKU. Product identity "
+            "matches the reference. Face may be turned away, cropped, or soft focus; warm lighting; background softly blurred."
         ),
     ]
     backfill_suffix = (
         "VARIANT — EXTRA CATALOG ANGLE: New three-quarter or slight top-down angle vs the reference; "
-        "clean neutral studio or minimal set; no people; product-centered."
+        "clean neutral studio or minimal set; no people; product-centered. "
+        "Product rests or leans believably on the set — no unstable vertical balancing on a bare surface."
     )
 
     def _shot_prompt(variant_body: str) -> str:
@@ -1122,7 +1316,9 @@ def generate_additional_product_images(
             "Each IMAGE block is one output and must follow that block’s VARIANT role: "
             "block 1 = different angle (studio only), block 2 = different application/usage scenario (no visible person), "
             "block 3 = person-in-use lifestyle. Do not reuse the same creative role across blocks. "
-            "Same product identity across all; no text or watermarks in outputs.\n\n"
+            "Same product identity across all; no text or watermarks in outputs. "
+            "All outputs: **physical realism** above; person blocks = **relaxed but physically reasonable** use — correct "
+            "body/target, angle, and mode when the product acts on the person; correct orientation for directional tools.\n\n"
             + brief_blocks
         )
         try:
@@ -1134,78 +1330,104 @@ def generate_additional_product_images(
                     count=want,
                 )
             )[:want]
-        except Exception:
+        except Exception as exc:
             binaries = []
+            _record_extra_marketing_exception(
+                exc, stage="batch_variants", model_id=model, warn_tag="batch0", warnings=warnings
+            )
         _log_extra("batch_variants_rq", 0, multi_prompt, bool(binaries))
 
-    # Per-shot num_images=1 (legacy path; reliable for many RQ image models when num_images>1 is flaky).
-    for si in range(len(binaries), want):
-        prompt_one = _shot_prompt(shot_lines[si])
-        got = False
-        try:
-            one = rq.run_image_variants(
-                model=model,
-                reference_image=source_for_generation,
-                prompt=prompt_one,
-                count=1,
-            )
-            got = bool(one)
-            if one:
-                binaries.append(one[0])
-        except Exception:
-            pass
-        _log_extra("per_shot_variants_rq", si, prompt_one, got)
-
-    backfill_full = _shot_prompt(backfill_suffix)
-    backfill_round = 0
-    while len(binaries) < want and backfill_round < 6:
-        slot_bf = len(binaries)
-        got_bf = False
-        try:
-            extra = rq.run_image_variants(
-                model=model,
-                reference_image=source_for_generation,
-                prompt=backfill_full,
-                count=1,
-            )
-            got_bf = bool(extra)
-            if extra:
-                binaries.append(extra[0])
-        except Exception:
-            pass
-        _log_extra("backfill_variants_rq", slot_bf, backfill_full, got_bf)
-        backfill_round += 1
-
-    # Many RQ models return empty ``media_urls`` for the variants payload but succeed on the same
-    # ``run_image_edit`` path used for Step1 erase. Fill any remaining slots with per-shot edit calls.
-    use_edit_fb = (os.getenv("GMI_EXTRA_IMAGES_USE_EDIT_FALLBACK") or "1").strip().lower() not in (
+    use_edit_fb = (os.getenv("GMI_EXTRA_IMAGES_USE_EDIT_FALLBACK") or "0").strip().lower() not in (
         "0",
         "false",
         "no",
         "off",
     )
-    if use_edit_fb and len(binaries) < want and not rq.mock:
-        edit_tries = 0
-        edit_cap = max(want * 3, 6)
-        while len(binaries) < want and edit_tries < edit_cap:
-            idx = len(binaries)
-            line = shot_lines[idx] if idx < len(shot_lines) else backfill_suffix
-            prompt_edit = _shot_prompt(line)
-            edit_tries += 1
-            got_ed = False
-            try:
-                blob = rq.run_image_edit(
-                    model=model,
-                    source_image=source_for_generation,
-                    prompt=prompt_edit,
-                    mask_image=None,
-                )
-                got_ed = bool(blob)
-                if blob:
-                    binaries.append(blob)
-            except Exception:
-                pass
-            _log_extra("edit_fallback_rq", idx, prompt_edit, got_ed)
+    fb_resolved = (fallback_model or "").strip() or (os.getenv("GMI_FALLBACK_IMAGE_MODEL") or "").strip() or None
+    ref_bytes = source_for_generation.read_bytes() if not rq.mock else b""
+    if binaries and ref_bytes:
+        n_batch = len(binaries)
+        binaries = [b for b in binaries if b != ref_bytes]
+        if len(binaries) < n_batch and warnings is not None:
+            warnings.append(
+                "extra_images_batch_dropped_reference_identical: removed batch output(s) equal to reference bytes"
+            )
+
+    try:
+        parallel = max(1, min(8, int((os.getenv("GMI_EXTRA_IMAGES_MAX_PARALLEL") or "1").strip())))
+    except ValueError:
+        parallel = 1
+
+    if len(binaries) < want and parallel <= 1:
+        for si in range(len(binaries), want):
+            prompt_one = _shot_prompt(shot_lines[si])
+            got_b = _extra_marketing_fetch_bytes(
+                rq,
+                source_for_generation,
+                prompt_one,
+                model,
+                fb_resolved,
+                use_edit_fallback=use_edit_fb,
+                ref_bytes=ref_bytes,
+                warnings=warnings,
+                warn_tag=f"slot{si}",
+            )
+            _log_extra("per_shot_merged_rq", si, prompt_one, bool(got_b))
+            if got_b:
+                binaries.append(got_b)
+
+    elif len(binaries) < want:
+        slots = list(range(len(binaries), want))
+
+        def _parallel_extra_slot(si: int) -> Tuple[int, Optional[bytes]]:
+            prompt_one = _shot_prompt(shot_lines[si])
+            b = _extra_marketing_fetch_bytes(
+                rq,
+                source_for_generation,
+                prompt_one,
+                model,
+                fb_resolved,
+                use_edit_fallback=use_edit_fb,
+                ref_bytes=ref_bytes,
+                warnings=warnings,
+                warn_tag=f"slot{si}",
+            )
+            return si, b
+
+        got_by_si: Dict[int, Optional[bytes]] = {}
+        workers = min(parallel, max(1, len(slots)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            fut_map = {pool.submit(_parallel_extra_slot, si): si for si in slots}
+            for fut in as_completed(fut_map):
+                si, blob = fut.result()
+                got_by_si[si] = blob
+        for si in sorted(slots):
+            prompt_one = _shot_prompt(shot_lines[si])
+            got_b = got_by_si.get(si)
+            _log_extra("per_shot_merged_rq", si, prompt_one, bool(got_b))
+            if got_b:
+                binaries.append(got_b)
+
+    backfill_full = _shot_prompt(backfill_suffix)
+    backfill_round = 0
+    backfill_max = _extra_marketing_backfill_cap(model)
+    while len(binaries) < want and backfill_round < backfill_max:
+        slot_bf = len(binaries)
+        got_bf = _extra_marketing_fetch_bytes(
+            rq,
+            source_for_generation,
+            backfill_full,
+            model,
+            fb_resolved,
+            use_edit_fallback=use_edit_fb,
+            ref_bytes=ref_bytes,
+            warnings=warnings,
+            warn_tag=f"backfill{backfill_round}",
+        )
+        _log_extra("backfill_merged_rq", slot_bf, backfill_full, bool(got_bf))
+        if got_bf:
+            binaries.append(got_bf)
+        backfill_round += 1
 
     if len(binaries) < want and (os.getenv("GMI_EXTRA_IMAGES_PLACEHOLDER") or "").strip().lower() in (
         "1",
@@ -1214,9 +1436,9 @@ def generate_additional_product_images(
         "on",
     ):
         shortfall = want - len(binaries)
-        ref_bytes = source_for_generation.read_bytes()
+        ref_fill = source_for_generation.read_bytes()
         while len(binaries) < want:
-            binaries.append(ref_bytes)
+            binaries.append(ref_fill)
         if warnings is not None:
             warnings.append(
                 f"extra_images_placeholder: RQ model {model!r} returned no images; copied reference image "
@@ -2347,13 +2569,18 @@ def run_step4c_locale_grammar_review(
     model_french: str,
     en: LocalizedListing,
     fr: LocalizedListing,
-) -> Dict[str, Any]:
-    """Two text-only reviewers: Canadian English and Canadian French grammar/conventions (separate models)."""
+) -> Tuple[Dict[str, Any], bool]:
+    """Two text-only reviewers: Canadian English and Canadian French grammar/conventions (separate models).
+
+    Returns ``(review_dict, any_side_call_failed)``. Per-language ``chat_json`` errors are caught so one
+    side can succeed while the other fails (same resilience pattern as Step4b). Previously, either
+    side raising aborted the whole step and the pipeline duplicated one exception into both locales.
+    """
     if chat.mock:
         ok = _normalize_locale_grammar_block(
             {"status": "pass", "issues": [], "suggested_edits": "", "notes": "Mock: skipped."}
         )
-        return {"canadian_english": ok, "canadian_french": {**ok}}
+        return {"canadian_english": ok, "canadian_french": {**ok}}, False
 
     en_json = json.dumps(asdict(en), ensure_ascii=False, indent=2)
     en_prompt = f"""
@@ -2403,37 +2630,63 @@ Rules:
 - issues can be written in French.
 """.strip()
 
-    def _en_block() -> Dict[str, Any]:
-        en_raw = chat.chat_json(
-            model=model_english,
-            messages=[
-                {"role": "system", "content": "You are a Canadian English editor. Output strict JSON only."},
-                {"role": "user", "content": en_prompt},
-            ],
-            max_tokens=900,
-            temperature=0.1,
-        )
-        return _normalize_locale_grammar_block(en_raw if isinstance(en_raw, dict) else {})
+    def _en_block() -> Tuple[Dict[str, Any], bool]:
+        try:
+            en_raw = chat.chat_json(
+                model=model_english,
+                messages=[
+                    {"role": "system", "content": "You are a Canadian English editor. Output strict JSON only."},
+                    {"role": "user", "content": en_prompt},
+                ],
+                max_tokens=900,
+                temperature=0.1,
+            )
+            return _normalize_locale_grammar_block(en_raw if isinstance(en_raw, dict) else {}), False
+        except Exception as exc:
+            return (
+                _normalize_locale_grammar_block(
+                    {
+                        "status": "revise",
+                        "issues": [str(exc)],
+                        "suggested_edits": "",
+                        "notes": "Canadian English locale grammar reviewer call failed.",
+                    }
+                ),
+                True,
+            )
 
-    def _fr_block() -> Dict[str, Any]:
-        fr_raw = chat.chat_json(
-            model=model_french,
-            messages=[
-                {"role": "system", "content": "You are a Canadian French editor. Output strict JSON only."},
-                {"role": "user", "content": fr_prompt},
-            ],
-            max_tokens=900,
-            temperature=0.1,
-        )
-        return _normalize_locale_grammar_block(fr_raw if isinstance(fr_raw, dict) else {})
+    def _fr_block() -> Tuple[Dict[str, Any], bool]:
+        try:
+            fr_raw = chat.chat_json(
+                model=model_french,
+                messages=[
+                    {"role": "system", "content": "You are a Canadian French editor. Output strict JSON only."},
+                    {"role": "user", "content": fr_prompt},
+                ],
+                max_tokens=900,
+                temperature=0.1,
+            )
+            return _normalize_locale_grammar_block(fr_raw if isinstance(fr_raw, dict) else {}), False
+        except Exception as exc:
+            return (
+                _normalize_locale_grammar_block(
+                    {
+                        "status": "revise",
+                        "issues": [str(exc)],
+                        "suggested_edits": "",
+                        "notes": "Canadian French locale grammar reviewer call failed.",
+                    }
+                ),
+                True,
+            )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         f_en = pool.submit(_en_block)
         f_fr = pool.submit(_fr_block)
-        en_block = f_en.result()
-        fr_block = f_fr.result()
+        en_block, en_failed = f_en.result()
+        fr_block, fr_failed = f_fr.result()
 
-    return {"canadian_english": en_block, "canadian_french": fr_block}
+    return {"canadian_english": en_block, "canadian_french": fr_block}, (en_failed or fr_failed)
 
 
 def parse_json_content(content: Any) -> Dict[str, Any]:
@@ -2739,7 +2992,7 @@ def _heuristic_listing_param_fills(
 
     brand = str(structured.get("brand_or_series") or "").strip()
     if brand:
-        fills["param_brand"] = "KANGFU" if brand.lower() == "kangfu" else brand
+        fills["param_brand"] = brand
 
     pt = str(structured.get("product_type") or "").strip()
     if pt and not _structured_field_weak(pt):
@@ -2901,6 +3154,50 @@ def _rq_outcome_debug_enabled() -> bool:
     return (os.getenv("GMI_RQ_OUTCOME_DEBUG") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _rq_outcome_debug_deep_enabled() -> bool:
+    return (os.getenv("GMI_RQ_OUTCOME_DEBUG_DEEP") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _rq_outcome_debug_deep_tree(outcome: Dict[str, Any], max_depth: int = 3) -> str:
+    """Multi-line nested key / shape summary (no full base64). max_depth caps recursion."""
+
+    def walk(obj: Any, depth: int, indent: str) -> List[str]:
+        if depth > max_depth:
+            return [f"{indent}…"]
+        lines: List[str] = []
+        if isinstance(obj, dict):
+            keys = sorted(obj.keys())
+            for k in keys[:48]:
+                v = obj[k]
+                if isinstance(v, dict):
+                    lines.append(f"{indent}{k}: dict(n_keys={len(v)})")
+                    lines.extend(walk(v, depth + 1, indent + "  "))
+                elif isinstance(v, list):
+                    lines.append(f"{indent}{k}: list(n={len(v)})")
+                    if v:
+                        el0 = v[0]
+                        if isinstance(el0, dict):
+                            lines.append(f"{indent}  [0]: dict(n_keys={len(el0)})")
+                            lines.extend(walk(el0, depth + 1, indent + "    "))
+                        elif isinstance(el0, str):
+                            lines.append(f"{indent}  [0]: str(len={len(el0)},head={el0[:40]!r}…)")
+                        else:
+                            lines.append(f"{indent}  [0]: {type(el0).__name__}")
+                elif isinstance(v, str):
+                    lines.append(f"{indent}{k}: str(len={len(v)},head={v[:48]!r}…)")
+                elif isinstance(v, (bytes, bytearray)):
+                    lines.append(f"{indent}{k}: bytes(n={len(v)})")
+                else:
+                    lines.append(f"{indent}{k}: {type(v).__name__}")
+            if len(keys) > 48:
+                lines.append(f"{indent}…({len(keys) - 48} more keys)")
+        elif isinstance(obj, list) and obj:
+            lines.extend(walk(obj[0], depth, indent + "[0] "))
+        return lines
+
+    return "\n".join(walk(outcome, 0, ""))
+
+
 def _rq_outcome_debug_summary(outcome: Any, max_keys: int = 36) -> str:
     if outcome is None:
         return "outcome=None"
@@ -2926,9 +3223,10 @@ def _rq_outcome_debug_summary(outcome: Any, max_keys: int = 36) -> str:
 
 
 def _log_rq_outcome_debug(component: str, outcome: Any) -> None:
-    if not _rq_outcome_debug_enabled():
-        return
-    print(f"GMI RQ outcome debug [{component}]: {_rq_outcome_debug_summary(outcome)}", file=sys.stderr)
+    if _rq_outcome_debug_enabled():
+        print(f"GMI RQ outcome debug [{component}]: {_rq_outcome_debug_summary(outcome)}", file=sys.stderr)
+    if _rq_outcome_debug_deep_enabled() and isinstance(outcome, dict):
+        print(f"GMI RQ outcome debug-deep [{component}]:\n{_rq_outcome_debug_deep_tree(outcome)}", file=sys.stderr)
 
 
 def extract_media_url(outcome: Dict[str, Any]) -> Optional[str]:
@@ -2988,6 +3286,12 @@ def extract_media_bytes_from_outcome(outcome: Any, _depth: int = 0) -> Optional[
     """
     if _depth > 8 or not isinstance(outcome, dict):
         return None
+    for top_str_key in ("data", "content"):
+        tv = outcome.get(top_str_key)
+        if isinstance(tv, str):
+            got = _decode_inline_image_string(tv)
+            if got:
+                return got
     for dk in ("url", "image_url", "output_url", "result_url", "preview_image_url", "uri", "href"):
         v = outcome.get(dk)
         if isinstance(v, str) and v.startswith("data:"):
@@ -3030,6 +3334,9 @@ def extract_media_bytes_from_outcome(outcome: Any, _depth: int = 0) -> Optional[
         "outputs",
         "artifacts",
         "candidates",
+        "files",
+        "media",
+        "items",
     ):
         v = outcome.get(key)
         if not isinstance(v, list):
@@ -3062,7 +3369,173 @@ def extract_media_bytes_from_outcome(outcome: Any, _depth: int = 0) -> Optional[
             got = extract_media_bytes_from_outcome({"images": inner}, _depth + 1)
             if got:
                 return got
+        elif isinstance(inner, str):
+            got = _decode_inline_image_string(inner)
+            if got:
+                return got
     return None
+
+
+def extract_all_media_bytes_from_outcome(
+    outcome: Any,
+    *,
+    max_n: Optional[int] = None,
+    _depth: int = 0,
+) -> List[bytes]:
+    """Collect up to ``max_n`` distinct image byte blobs from an RQ outcome (multi-image / nested).
+
+    Used when ``media_urls`` is populated but the first-pass decode in ``run_image_variants`` missed paths
+    (e.g. nested ``data.url``, extra list keys). De-duplicates by SHA-256 of raw bytes.
+    """
+    if _depth > 8 or not isinstance(outcome, dict):
+        return []
+    collected: List[bytes] = []
+    seen_hash: set[str] = set()
+
+    def _push(raw: Optional[bytes]) -> None:
+        if not raw or len(raw) < 200:
+            return
+        if max_n is not None and len(collected) >= max_n:
+            return
+        h = hashlib.sha256(raw).hexdigest()
+        if h in seen_hash:
+            return
+        seen_hash.add(h)
+        collected.append(raw)
+
+    for top_sk in ("data", "content"):
+        tv = outcome.get(top_sk)
+        if isinstance(tv, str):
+            _push(_decode_inline_image_string(tv))
+
+    media_urls = outcome.get("media_urls")
+    if isinstance(media_urls, list):
+        for item in media_urls:
+            if max_n is not None and len(collected) >= max_n:
+                break
+            if isinstance(item, dict):
+                u = None
+                for kk in ("url", "uri", "href", "signed_url", "output_url", "image_url"):
+                    x = item.get(kk)
+                    if isinstance(x, str) and x.startswith("http"):
+                        u = x
+                        break
+                if u:
+                    try:
+                        r = requests.get(u, timeout=120)
+                        r.raise_for_status()
+                        _push(r.content)
+                    except Exception:
+                        pass
+                nested = item.get("data")
+                if isinstance(nested, dict):
+                    for kk in ("url", "uri", "signed_url", "output_url", "image_url"):
+                        x = nested.get(kk)
+                        if isinstance(x, str) and x.startswith("http"):
+                            try:
+                                r = requests.get(x, timeout=120)
+                                r.raise_for_status()
+                                _push(r.content)
+                            except Exception:
+                                pass
+                elif isinstance(nested, str):
+                    _push(_decode_inline_image_string(nested))
+                for k in ("image", "image_base64", "base64", "data", "b64_json"):
+                    v = item.get(k)
+                    if isinstance(v, str):
+                        dec = _decode_inline_image_string(v)
+                        if dec:
+                            _push(dec)
+                got_item = extract_media_bytes_from_outcome(item, _depth=_depth + 1)
+                if got_item:
+                    _push(got_item)
+            elif isinstance(item, str):
+                if item.startswith("http"):
+                    try:
+                        r = requests.get(item, timeout=120)
+                        r.raise_for_status()
+                        _push(r.content)
+                    except Exception:
+                        pass
+                else:
+                    dec = _decode_inline_image_string(item)
+                    if dec:
+                        _push(dec)
+
+    for key in (
+        "images",
+        "image_list",
+        "output_images",
+        "generated_images",
+        "results",
+        "outputs",
+        "artifacts",
+        "candidates",
+        "files",
+        "media",
+        "items",
+    ):
+        v = outcome.get(key)
+        if not isinstance(v, list):
+            continue
+        for item in v:
+            if max_n is not None and len(collected) >= max_n:
+                break
+            if isinstance(item, dict):
+                got = extract_media_bytes_from_outcome(item, _depth=_depth + 1)
+                if got:
+                    _push(got)
+            elif isinstance(item, str):
+                if item.startswith("http"):
+                    try:
+                        r = requests.get(item, timeout=120)
+                        r.raise_for_status()
+                        _push(r.content)
+                    except Exception:
+                        pass
+                else:
+                    dec = _decode_inline_image_string(item)
+                    if dec:
+                        _push(dec)
+
+    for kk in ("image_url", "output_url", "result_url", "preview_image_url", "url", "uri", "href", "signed_url"):
+        u = outcome.get(kk)
+        if isinstance(u, str) and u.startswith("http"):
+            try:
+                r = requests.get(u, timeout=120)
+                r.raise_for_status()
+                _push(r.content)
+            except Exception:
+                pass
+
+    for k in ("image_base64", "b64_json", "base64_image", "base64", "b64", "output_b64"):
+        v = outcome.get(k)
+        if isinstance(v, str):
+            dec = _decode_inline_image_string(v)
+            if dec:
+                _push(dec)
+
+    if max_n is None or len(collected) < max_n:
+        for wrap in ("result", "data", "output", "response", "outcome", "image_result"):
+            inner = outcome.get(wrap)
+            if isinstance(inner, dict):
+                for b in extract_all_media_bytes_from_outcome(inner, max_n=max_n, _depth=_depth + 1):
+                    _push(b)
+                    if max_n is not None and len(collected) >= max_n:
+                        break
+            elif isinstance(inner, list):
+                for b in extract_all_media_bytes_from_outcome({"images": inner}, max_n=max_n, _depth=_depth + 1):
+                    _push(b)
+                    if max_n is not None and len(collected) >= max_n:
+                        break
+            elif isinstance(inner, str):
+                _push(_decode_inline_image_string(inner))
+                if max_n is not None and len(collected) >= max_n:
+                    break
+
+    if max_n is None:
+        return collected
+    return collected[:max_n]
 
 
 def write_output(artifacts: Sequence[EcommerceArtifact], output_path: Path) -> Path:
@@ -3072,10 +3545,12 @@ def write_output(artifacts: Sequence[EcommerceArtifact], output_path: Path) -> P
         try:
             import yaml  # type: ignore
 
+            if not hasattr(yaml, "safe_dump"):
+                raise ImportError("PyYAML provides yaml.safe_dump; check for a shadowing yaml.py / wrong package.")
             with output_path.open("w", encoding="utf-8") as fp:
                 yaml.safe_dump([asdict(a) for a in artifacts], fp, allow_unicode=True, sort_keys=False)
             return output_path
-        except ImportError:
+        except (ImportError, AttributeError):
             output_path = output_path.with_suffix(".json")
             suffix = ".json"
     if suffix == ".json":
@@ -3363,6 +3838,8 @@ def run_pipeline(args: argparse.Namespace) -> Path:
 
     rq = RequestQueueClient(api_key=api_key or "mock", mock=args.mock, max_attempts=args.max_attempts)
     chat = ChatClient(api_key=api_key or "mock", mock=args.mock, max_attempts=args.max_attempts)
+    # Executor for per-SKU parallelism (e.g., listing vs extra images after Step3).
+    executor = ThreadPoolExecutor(max_workers=max(2, int(os.getenv("GMI_PARALLEL_WORKERS_PER_SKU", "2"))))
     input_items = collect_input_items(args)
     run_started_at = _utc_now_iso()
     stability_stats: Dict[str, Any] = {
@@ -3390,6 +3867,14 @@ def run_pipeline(args: argparse.Namespace) -> Path:
 
     work_img_dir = Path(args.image_output_dir)
     work_img_dir.mkdir(parents=True, exist_ok=True)
+
+    pp_file = getattr(args, "pipeline_progress_file", None)
+    pipeline_progress_init(Path(pp_file).expanduser().resolve() if pp_file else None)
+    pipeline_progress_emit(
+        "pipeline",
+        "run_start",
+        detail=f"items={len(input_items)} mock={bool(args.mock)} out={args.output}",
+    )
 
     instr_warnings: List[str] = []
     user_copy_resolved = resolve_operator_instructions(
@@ -3421,6 +3906,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
 
     artifacts: List[EcommerceArtifact] = []
     for product_id, source_image, ann in input_items:
+        pipeline_progress_emit("sku", "item_start", product_id=product_id, detail=source_image.name)
         warnings: List[str] = []
         spans = parse_annotation_file(ann) if ann is not None else []
         extracted_raw = [s.text for s in spans if s.text]
@@ -3437,13 +3923,14 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         if not args.disable_erase and (not args.no_mask) and args.mask_mode in {"overlay", "all"}:
             audit_model = (getattr(args, "annotation_audit_model", "") or "").strip() or args.vision_model
             if getattr(args, "annotation_audit", True) and not chat.mock and spans:
-                audited = audit_mtwi_annotation_spans(
-                    chat=chat,
-                    model=audit_model,
-                    source_image=source_image,
-                    spans=spans,
-                    warnings=warnings,
-                )
+                with pipeline_progress_span("annotation_audit", model=audit_model, product_id=product_id):
+                    audited = audit_mtwi_annotation_spans(
+                        chat=chat,
+                        model=audit_model,
+                        source_image=source_image,
+                        spans=spans,
+                        warnings=warnings,
+                    )
                 if audited is not None:
                     erased_span_indices = audited
                     if not audited and spans:
@@ -3465,26 +3952,33 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             spans_for_mask = [spans[i] for i in erased_span_indices] if erased_span_indices is not None else spans
 
         if not args.disable_erase:
+            s1_model = "local_opencv" if args.erase_strategy == "local" else str(args.eraser_model)
             try:
-                if args.erase_strategy == "local":
-                    erased_path = run_step1_text_erase_local(
-                        source_image=source_image,
-                        spans=spans_for_mask,
-                        product_id=product_id,
-                        out_dir=work_img_dir,
-                        use_mask=not bool(args.no_mask),
-                    )
-                else:
-                    erased_path = run_step1_text_erase(
-                        rq=rq,
-                        source_image=source_image,
-                        spans=spans_for_mask,
-                        product_id=product_id,
-                        out_dir=work_img_dir,
-                        eraser_model=args.eraser_model,
-                        use_mask=not bool(args.no_mask),
-                        user_image_instructions=user_image_resolved,
-                    )
+                with pipeline_progress_span(
+                    "step1_erase",
+                    model=s1_model,
+                    product_id=product_id,
+                    detail=args.erase_strategy,
+                ):
+                    if args.erase_strategy == "local":
+                        erased_path = run_step1_text_erase_local(
+                            source_image=source_image,
+                            spans=spans_for_mask,
+                            product_id=product_id,
+                            out_dir=work_img_dir,
+                            use_mask=not bool(args.no_mask),
+                        )
+                    else:
+                        erased_path = run_step1_text_erase(
+                            rq=rq,
+                            source_image=source_image,
+                            spans=spans_for_mask,
+                            product_id=product_id,
+                            out_dir=work_img_dir,
+                            eraser_model=args.eraser_model,
+                            use_mask=not bool(args.no_mask),
+                            user_image_instructions=user_image_resolved,
+                        )
             except Exception as exc:
                 warnings.append(f"step1_erase_failed: {exc}")
                 stability_stats["step1_erase_failed"] += 1
@@ -3494,14 +3988,19 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         # Optional naturalization pass to fix local erase artifacts.
         if args.harmonize_after_erase:
             try:
-                harmonized = run_step2_harmonize_model(
-                    rq=rq,
-                    erased_image=erased_path,
+                with pipeline_progress_span(
+                    "step2_harmonize",
+                    model=str(args.harmonize_model),
                     product_id=product_id,
-                    out_dir=work_img_dir,
-                    harmonize_model=args.harmonize_model,
-                    user_image_instructions=user_image_resolved,
-                )
+                ):
+                    harmonized = run_step2_harmonize_model(
+                        rq=rq,
+                        erased_image=erased_path,
+                        product_id=product_id,
+                        out_dir=work_img_dir,
+                        harmonize_model=args.harmonize_model,
+                        user_image_instructions=user_image_resolved,
+                    )
                 if harmonized is not None:
                     erased_path = harmonized
             except Exception as exc:
@@ -3509,21 +4008,27 @@ def run_pipeline(args: argparse.Namespace) -> Path:
 
         if not args.disable_restore:
             try:
-                if args.quality_strategy == "local":
-                    final_path = run_step2_enhance_local(
-                        erased_image=erased_path,
-                        product_id=product_id,
-                        out_dir=work_img_dir,
-                    )
-                else:
-                    final_path = run_step2_restore(
-                        rq=rq,
-                        erased_image=erased_path,
-                        product_id=product_id,
-                        out_dir=work_img_dir,
-                        restore_model=args.restore_model,
-                        user_image_instructions=user_image_resolved,
-                    )
+                with pipeline_progress_span(
+                    "step2_restore",
+                    model="local_pil" if args.quality_strategy == "local" else str(args.restore_model),
+                    product_id=product_id,
+                    detail=args.quality_strategy,
+                ):
+                    if args.quality_strategy == "local":
+                        final_path = run_step2_enhance_local(
+                            erased_image=erased_path,
+                            product_id=product_id,
+                            out_dir=work_img_dir,
+                        )
+                    else:
+                        final_path = run_step2_restore(
+                            rq=rq,
+                            erased_image=erased_path,
+                            product_id=product_id,
+                            out_dir=work_img_dir,
+                            restore_model=args.restore_model,
+                            user_image_instructions=user_image_resolved,
+                        )
             except Exception as exc:
                 warnings.append(f"step2_restore_failed: {exc}")
                 stability_stats["step2_restore_failed"] += 1
@@ -3552,31 +4057,43 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                 mini_struct: Dict[str, Any] = {"product_type": "", "key_features": extracted[:6] if extracted else []}
                 early: List[str] = []
                 try:
-                    early = generate_additional_product_images(
-                        rq=rq,
-                        source_for_generation=final_path,
+                    with pipeline_progress_span(
+                        "extra1_pregen",
+                        model=str(args.additional_image_model),
                         product_id=product_id,
-                        out_dir=work_img_dir,
-                        model=args.additional_image_model,
-                        count=1,
-                        structured_attributes=mini_struct,
-                        user_image_instructions=user_image_resolved,
-                        scenario_offset=0,
-                        first_file_index=1,
-                        warnings=warnings,
-                    )
+                        detail="copy_understand_image=extra1",
+                    ):
+                        early = generate_additional_product_images(
+                            rq=rq,
+                            source_for_generation=final_path,
+                            product_id=product_id,
+                            out_dir=work_img_dir,
+                            model=args.additional_image_model,
+                            count=1,
+                            structured_attributes=mini_struct,
+                            user_image_instructions=user_image_resolved,
+                            scenario_offset=0,
+                            first_file_index=1,
+                            warnings=warnings,
+                            fallback_model=getattr(args, "fallback_additional_image_model", None) or None,
+                        )
                 except Exception as exc:
                     warnings.append(f"listing_extra1_pregen_failed: {exc}")
                 if early:
                     ex_path = Path(early[0])
                     pre_additional_paths = [str(ex_path)]
-                    listing_ref_audit = run_listing_reference_consistency_audit(
-                        chat=chat,
-                        model=args.vision_model,
-                        original_listing_image=source_image,
-                        marketing_variant_image=ex_path,
-                        warnings=warnings,
-                    )
+                    with pipeline_progress_span(
+                        "listing_reference_audit",
+                        model=str(args.vision_model),
+                        product_id=product_id,
+                    ):
+                        listing_ref_audit = run_listing_reference_consistency_audit(
+                            chat=chat,
+                            model=args.vision_model,
+                            original_listing_image=source_image,
+                            marketing_variant_image=ex_path,
+                            warnings=warnings,
+                        )
                     if listing_ref_audit.get("safe_to_use_variant_for_copy"):
                         step3_img = ex_path
                         image_context = "marketing_variant"
@@ -3587,14 +4104,20 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                     warnings.append("listing_extra1_pregen_empty: using final for step3")
 
         try:
-            structured = run_step3_understand_product(
-                chat=chat,
-                model=args.vision_model,
+            with pipeline_progress_span(
+                "step3_vision",
+                model=str(args.vision_model),
                 product_id=product_id,
-                vision_image=step3_img,
-                extracted_text=extracted,
-                image_context=image_context,
-            )
+                detail=image_context,
+            ):
+                structured = run_step3_understand_product(
+                    chat=chat,
+                    model=args.vision_model,
+                    product_id=product_id,
+                    vision_image=step3_img,
+                    extracted_text=extracted,
+                    image_context=image_context,
+                )
         except Exception as exc:
             warnings.append(f"step3_vision_failed: {exc}")
             stability_stats["step3_vision_failed"] += 1
@@ -3612,30 +4135,66 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         if structured.get("confidence") == "medium_ocr_fallback":
             warnings.append("structured_attributes_enriched_from_ocr: vision step unavailable or weak; filled gaps from on-image text")
 
+        # Step5: prepare additional marketing images generation task. This can run in
+        # parallel with Step4 (listing) and Step4b/4c (reviews) once Step3 is done.
+        additional_images: List[str] = list(pre_additional_paths)
+        extras_future = None
+        if args.generate_additional_images and final_path:
+            n_extra = max(0, int(args.additional_image_count))
+            need = max(0, n_extra - len(additional_images))
+
+            if need > 0:
+                def _extra_images_task() -> Tuple[List[str], List[str]]:
+                    local_warnings: List[str] = []
+                    more_paths: List[str] = []
+                    try:
+                        more_paths = generate_additional_product_images(
+                            rq=rq,
+                            source_for_generation=final_path,
+                            product_id=product_id,
+                            out_dir=work_img_dir,
+                            model=args.additional_image_model,
+                            count=need,
+                            structured_attributes=structured,
+                            user_image_instructions=user_image_resolved,
+                            scenario_offset=1 if pre_additional_paths else 0,
+                            first_file_index=len(additional_images) + 1,
+                            warnings=local_warnings,
+                            fallback_model=getattr(args, "fallback_additional_image_model", None) or None,
+                        )
+                        if len(more_paths) < need:
+                            local_warnings.append(
+                                f"extra_images_shortfall: requested {need} from RQ model {args.additional_image_model!r}, "
+                                f"got {len(more_paths)}. Try --fallback-additional-image-model / GMI_FALLBACK_IMAGE_MODEL, "
+                                "GMI_EXTRA_IMAGES_SEEDREAM_USE_EDIT_FALLBACK=1 (Seedream), GMI_EXTRA_IMAGES_USE_EDIT_FALLBACK, "
+                                "GMI_RQ_OUTCOME_DEBUG=1, lower GMI_EXTRA_IMAGES_MAX_PARALLEL, or GMI_EXTRA_IMAGES_BATCH=0; "
+                                "see generate_additional_product_images docstring and stderr for extra_images_rq_* lines."
+                            )
+                    except Exception as exc:
+                        local_warnings.append(f"extra_images_failed: {exc}")
+                    return more_paths, local_warnings
+
+                extras_future = executor.submit(_extra_images_task)
+        elif args.generate_additional_images and not final_path:
+            warnings.append("extra_images_skipped_no_final_path")
+
         step4_primary_failed = False
         cleaned_listing_image: Optional[Path] = final_path or erased_path
-        if args.copy_generation_mode == "unified":
-            warnings.append("step4_copy_generation_mode_unified")
-            try:
-                en, fr = run_step4_generate_listing_dual_image_bilingual(
-                    chat=chat,
-                    model=args.unified_copy_model,
-                    source_image=source_image,
-                    cleaned_image=cleaned_listing_image,
-                    structured_attributes=structured,
-                    extracted_text=extracted,
-                    user_copy_instructions=user_copy_resolved,
-                    warnings=warnings,
-                )
-                if _step4_copy_listing_degenerate(en) or _step4_copy_listing_degenerate(fr):
-                    raise RuntimeError("step4_unified_degenerate_listing")
-            except Exception as exc:
-                step4_primary_failed = True
-                warnings.append(f"step4_unified_copy_primary_failed: {exc}")
+        s4_model = (
+            str(args.unified_copy_model) if args.copy_generation_mode == "unified" else str(args.english_copy_model)
+        )
+        with pipeline_progress_span(
+            "step4_listing",
+            model=s4_model,
+            product_id=product_id,
+            detail=str(args.copy_generation_mode),
+        ):
+            if args.copy_generation_mode == "unified":
+                warnings.append("step4_copy_generation_mode_unified")
                 try:
                     en, fr = run_step4_generate_listing_dual_image_bilingual(
                         chat=chat,
-                        model=args.fallback_english_copy_model,
+                        model=args.unified_copy_model,
                         source_image=source_image,
                         cleaned_image=cleaned_listing_image,
                         structured_attributes=structured,
@@ -3644,37 +4203,37 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                         warnings=warnings,
                     )
                     if _step4_copy_listing_degenerate(en) or _step4_copy_listing_degenerate(fr):
-                        raise RuntimeError("step4_unified_fallback_degenerate_listing")
-                    warnings.append(f"step4_unified_copy_fallback_used: {args.fallback_english_copy_model}")
-                    stability_stats["step4_copy_fallback_used"] += 1
-                except Exception as fb_exc:
-                    warnings.append(f"step4_unified_copy_fallback_failed: {fb_exc}")
-                    stability_stats["step4_copy_fallback_failed"] += 1
-                    en = build_step4_heuristic_listing(structured, extracted, "canadian_english")
-                    fr = build_step4_heuristic_listing(structured, extracted, "canadian_french")
-                    warnings.append("step4_unified_heuristic_used_after_model_failure")
-        else:
-            warnings.append("step4_copy_generation_mode_split_dual_image")
-            try:
-                en, fr = run_step4_generate_listing_dual_image_bilingual(
-                    chat=chat,
-                    model=args.english_copy_model,
-                    source_image=source_image,
-                    cleaned_image=cleaned_listing_image,
-                    structured_attributes=structured,
-                    extracted_text=extracted,
-                    user_copy_instructions=user_copy_resolved,
-                    warnings=warnings,
-                )
-                if _step4_copy_listing_degenerate(en) or _step4_copy_listing_degenerate(fr):
-                    raise RuntimeError("step4_split_dual_degenerate_listing")
-            except Exception as exc:
-                step4_primary_failed = True
-                warnings.append(f"step4_split_dual_copy_primary_failed: {exc}")
+                        raise RuntimeError("step4_unified_degenerate_listing")
+                except Exception as exc:
+                    step4_primary_failed = True
+                    warnings.append(f"step4_unified_copy_primary_failed: {exc}")
+                    try:
+                        en, fr = run_step4_generate_listing_dual_image_bilingual(
+                            chat=chat,
+                            model=args.fallback_english_copy_model,
+                            source_image=source_image,
+                            cleaned_image=cleaned_listing_image,
+                            structured_attributes=structured,
+                            extracted_text=extracted,
+                            user_copy_instructions=user_copy_resolved,
+                            warnings=warnings,
+                        )
+                        if _step4_copy_listing_degenerate(en) or _step4_copy_listing_degenerate(fr):
+                            raise RuntimeError("step4_unified_fallback_degenerate_listing")
+                        warnings.append(f"step4_unified_copy_fallback_used: {args.fallback_english_copy_model}")
+                        stability_stats["step4_copy_fallback_used"] += 1
+                    except Exception as fb_exc:
+                        warnings.append(f"step4_unified_copy_fallback_failed: {fb_exc}")
+                        stability_stats["step4_copy_fallback_failed"] += 1
+                        en = build_step4_heuristic_listing(structured, extracted, "canadian_english")
+                        fr = build_step4_heuristic_listing(structured, extracted, "canadian_french")
+                        warnings.append("step4_unified_heuristic_used_after_model_failure")
+            else:
+                warnings.append("step4_copy_generation_mode_split_dual_image")
                 try:
                     en, fr = run_step4_generate_listing_dual_image_bilingual(
                         chat=chat,
-                        model=args.fallback_english_copy_model,
+                        model=args.english_copy_model,
                         source_image=source_image,
                         cleaned_image=cleaned_listing_image,
                         structured_attributes=structured,
@@ -3683,27 +4242,43 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                         warnings=warnings,
                     )
                     if _step4_copy_listing_degenerate(en) or _step4_copy_listing_degenerate(fr):
-                        raise RuntimeError("step4_split_dual_fallback_degenerate_listing")
-                    warnings.append(f"step4_split_dual_copy_fallback_used: {args.fallback_english_copy_model}")
-                    stability_stats["step4_copy_fallback_used"] += 1
-                except Exception as fb_exc:
-                    warnings.append(f"step4_split_dual_copy_fallback_failed: {fb_exc}")
-                    stability_stats["step4_copy_fallback_failed"] += 1
-                    en = build_step4_heuristic_listing(structured, extracted, "canadian_english")
-                    fr = build_step4_heuristic_listing(structured, extracted, "canadian_french")
-                    warnings.append("step4_split_dual_heuristic_used_after_model_failure")
+                        raise RuntimeError("step4_split_dual_degenerate_listing")
+                except Exception as exc:
+                    step4_primary_failed = True
+                    warnings.append(f"step4_split_dual_copy_primary_failed: {exc}")
+                    try:
+                        en, fr = run_step4_generate_listing_dual_image_bilingual(
+                            chat=chat,
+                            model=args.fallback_english_copy_model,
+                            source_image=source_image,
+                            cleaned_image=cleaned_listing_image,
+                            structured_attributes=structured,
+                            extracted_text=extracted,
+                            user_copy_instructions=user_copy_resolved,
+                            warnings=warnings,
+                        )
+                        if _step4_copy_listing_degenerate(en) or _step4_copy_listing_degenerate(fr):
+                            raise RuntimeError("step4_split_dual_fallback_degenerate_listing")
+                        warnings.append(f"step4_split_dual_copy_fallback_used: {args.fallback_english_copy_model}")
+                        stability_stats["step4_copy_fallback_used"] += 1
+                    except Exception as fb_exc:
+                        warnings.append(f"step4_split_dual_copy_fallback_failed: {fb_exc}")
+                        stability_stats["step4_copy_fallback_failed"] += 1
+                        en = build_step4_heuristic_listing(structured, extracted, "canadian_english")
+                        fr = build_step4_heuristic_listing(structured, extracted, "canadian_french")
+                        warnings.append("step4_split_dual_heuristic_used_after_model_failure")
 
-            en, fr = _apply_simple_copy_recovery_if_needed(
-                chat=chat,
-                args=args,
-                structured=structured,
-                extracted=extracted,
-                user_copy_resolved=user_copy_resolved,
-                en=en,
-                fr=fr,
-                warnings=warnings,
-                listing_image=step3_img,
-            )
+                en, fr = _apply_simple_copy_recovery_if_needed(
+                    chat=chat,
+                    args=args,
+                    structured=structured,
+                    extracted=extracted,
+                    user_copy_resolved=user_copy_resolved,
+                    en=en,
+                    fr=fr,
+                    warnings=warnings,
+                    listing_image=step3_img,
+                )
 
         if step4_primary_failed:
             stability_stats["step4_copy_failed"] += 1
@@ -3714,17 +4289,22 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             warnings.append("listing_review_skipped: Step4b and Step4c not run (--skip-listing-review or GMI_SKIP_LISTING_REVIEW)")
         else:
             try:
-                copy_review, cr_side_failed = run_step4b_review_copy_bilingual(
-                    chat=chat,
-                    model_english=args.copy_review_english_model,
-                    model_french=args.copy_review_french_model,
+                with pipeline_progress_span(
+                    "step4b_copy_review",
+                    model=f"{args.copy_review_english_model} + {args.copy_review_french_model}",
                     product_id=product_id,
-                    source_image=source_image,
-                    structured_attributes=structured,
-                    en=en,
-                    fr=fr,
-                    user_copy_instructions=user_copy_resolved,
-                )
+                ):
+                    copy_review, cr_side_failed = run_step4b_review_copy_bilingual(
+                        chat=chat,
+                        model_english=args.copy_review_english_model,
+                        model_french=args.copy_review_french_model,
+                        product_id=product_id,
+                        source_image=source_image,
+                        structured_attributes=structured,
+                        en=en,
+                        fr=fr,
+                        user_copy_instructions=user_copy_resolved,
+                    )
                 if cr_side_failed:
                     warnings.append("step4b_copy_review_partial_failure: one or both reviewer calls failed")
                     stability_stats["step4b_copy_review_failed"] += 1
@@ -3750,13 +4330,23 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                 }
 
             try:
-                locale_grammar_review = run_step4c_locale_grammar_review(
-                    chat=chat,
-                    model_english=args.locale_grammar_english_model,
-                    model_french=args.locale_grammar_french_model,
-                    en=en,
-                    fr=fr,
-                )
+                with pipeline_progress_span(
+                    "step4c_locale_grammar",
+                    model=f"{args.locale_grammar_english_model} + {args.locale_grammar_french_model}",
+                    product_id=product_id,
+                ):
+                    locale_grammar_review, lg_side_failed = run_step4c_locale_grammar_review(
+                        chat=chat,
+                        model_english=args.locale_grammar_english_model,
+                        model_french=args.locale_grammar_french_model,
+                        en=en,
+                        fr=fr,
+                    )
+                if lg_side_failed:
+                    warnings.append(
+                        "step4c_locale_grammar_partial_failure: one or both locale grammar reviewer calls failed"
+                    )
+                    stability_stats["step4c_locale_grammar_failed"] += 1
                 en_g = locale_grammar_review.get("canadian_english", {})
                 fr_g = locale_grammar_review.get("canadian_french", {})
                 if not isinstance(en_g, dict):
@@ -3788,35 +4378,19 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                 )
                 locale_grammar_review = {"canadian_english": fb, "canadian_french": {**fb}}
 
-        additional_images: List[str] = list(pre_additional_paths)
-        if args.generate_additional_images and final_path:
-            n_extra = max(0, int(args.additional_image_count))
-            need = max(0, n_extra - len(additional_images))
-            if need > 0:
-                try:
-                    more = generate_additional_product_images(
-                        rq=rq,
-                        source_for_generation=final_path,
-                        product_id=product_id,
-                        out_dir=work_img_dir,
-                        model=args.additional_image_model,
-                        count=need,
-                        structured_attributes=structured,
-                        user_image_instructions=user_image_resolved,
-                        scenario_offset=1 if pre_additional_paths else 0,
-                        first_file_index=len(additional_images) + 1,
-                        warnings=warnings,
-                    )
-                    additional_images.extend(more)
-                    if len(more) < need:
-                        warnings.append(
-                            f"extra_images_shortfall: requested {need} from RQ model {args.additional_image_model!r}, "
-                            f"got {len(more)} (see GMI_EXTRA_IMAGES_BATCH / per-shot defaults in generate_additional_product_images)."
-                        )
-                except Exception as exc:
-                    warnings.append(f"extra_images_failed: {exc}")
-        elif args.generate_additional_images and not final_path:
-            warnings.append("extra_images_skipped_no_final_path")
+        # Join additional image generation (if scheduled) and merge warnings.
+        if extras_future is not None:
+            fb_x = getattr(args, "fallback_additional_image_model", "") or ""
+            with pipeline_progress_span(
+                "step5_marketing_extras",
+                model=str(args.additional_image_model),
+                product_id=product_id,
+                detail=(f"fallback={fb_x}" if fb_x.strip() else "no_fallback_model"),
+            ):
+                more_paths, extra_warnings = extras_future.result()
+            additional_images.extend(more_paths)
+            if extra_warnings:
+                warnings.extend(extra_warnings)
 
         artifacts.append(
             EcommerceArtifact(
@@ -3851,6 +4425,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         for w in warnings:
             if w.startswith("overlay_classifier_failed:"):
                 stability_stats["overlay_classifier_failed"] += 1
+        pipeline_progress_emit("sku", "item_end", product_id=product_id)
         if (stability_stats["processed"] % stability_update_every) == 0:
             snap = _build_stability_snapshot(stability_stats, len(input_items), run_started_at)
             _write_stability_reports(snap, stability_json_path, stability_md_path)
@@ -3859,18 +4434,39 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                 f"step4_failed={snap['step4_copy_failed']} fallback_used={snap['step4_copy_fallback_used']}"
             )
 
-    out_path = write_output(artifacts, Path(args.output))
+    # Ensure any background tasks are fully settled before writing outputs.
+    executor.shutdown(wait=True)
+    with pipeline_progress_span("write_output", detail=str(args.output)):
+        out_path = write_output(artifacts, Path(args.output))
     final_snap = _build_stability_snapshot(stability_stats, len(input_items), run_started_at)
     _write_stability_reports(final_snap, stability_json_path, stability_md_path)
     if args.export_deliverables:
-        index_csv = export_deliverables(artifacts, Path(args.deliverable_dir))
+        with pipeline_progress_span("export_deliverables", detail=str(args.deliverable_dir)):
+            index_csv = export_deliverables(artifacts, Path(args.deliverable_dir))
         print(f"Saved deliverable packages index to {index_csv}")
+    pipeline_progress_emit("pipeline", "run_complete", detail=str(out_path))
     return out_path
 
 
 def _default_copy_generation_mode() -> str:
     v = (os.getenv("GMI_COPY_GENERATION_MODE") or "unified").strip().lower()
     return v if v in ("split", "unified") else "unified"
+
+
+def _normalize_embedded_argv(argv: Sequence[str]) -> List[str]:
+    """Prepare argv for ``ArgumentParser.parse_args(args)`` when *args* is passed explicitly.
+
+    If *args* is ``None``, the parser uses ``sys.argv[1:]`` (shell already dropped the script name).
+
+    If *args* is a list/tuple, **every** element is parsed as a flag or value — there is **no**
+    implicit program name. A common mistake is to pass ``["mtwi_ecommerce_pipeline", "--foo", ...]``
+    mimicking ``sys.argv``; the first token is then reported as an *unrecognized argument* and
+    argparse exits with code 2. We strip **one** leading token iff it does not start with ``-``.
+    """
+    out = list(argv)
+    if out and not str(out[0]).startswith("-"):
+        out.pop(0)
+    return out
 
 
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
@@ -3894,6 +4490,11 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--deliverable-dir",
         default="outputs/deliverables",
         help="Output directory for packaged deliverables.",
+    )
+    parser.add_argument(
+        "--pipeline-progress-file",
+        default=os.getenv("GMI_PIPELINE_PROGRESS_FILE") or None,
+        help="Append JSONL progress events (also mirrors human lines to stderr). Overrides GMI_PIPELINE_PROGRESS_FILE.",
     )
     parser.add_argument("--limit", type=int, default=None, help="Limit number of products")
     parser.add_argument("--mock", action="store_true", help="Run in mock mode")
@@ -3952,19 +4553,20 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default=os.getenv("GMI_HARMONIZE_MODEL", "bria-fibo-edit"),
         help="Model used to harmonize artifact regions after text removal.",
     )
-    parser.set_defaults(generate_additional_images=True)
+    parser.set_defaults(generate_additional_images=False)
     _gen_img = parser.add_mutually_exclusive_group()
     _gen_img.add_argument(
         "--generate-additional-images",
         dest="generate_additional_images",
         action="store_true",
-        help="Generate marketing variants via Request Queue (default: on; count from --additional-image-count).",
+        help="Generate marketing variants via Request Queue (default: off). Use --additional-image-count (default 3). "
+        "For a dedicated RQ-only step after the main run, see src/run_marketing_extras_step.py.",
     )
     _gen_img.add_argument(
         "--no-generate-additional-images",
         dest="generate_additional_images",
         action="store_false",
-        help="Skip extra same-product shots (alternate angle, in-use, scene).",
+        help="Skip extra same-product shots (default).",
     )
     parser.add_argument(
         "--additional-image-model",
@@ -3976,6 +4578,12 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         type=int,
         default=3,
         help="How many additional product images to generate.",
+    )
+    parser.add_argument(
+        "--fallback-additional-image-model",
+        default=(os.getenv("GMI_FALLBACK_IMAGE_MODEL") or "").strip(),
+        help="Optional second Request Queue model for marketing extras when the primary returns empty or echoes "
+        "the reference (env: GMI_FALLBACK_IMAGE_MODEL). Empty = disabled.",
     )
     parser.add_argument(
         "--mask-mode",
@@ -4069,8 +4677,8 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--copy-review-english-model",
-        default=os.getenv("GMI_COPY_REVIEW_ENGLISH_MODEL", "openai/gpt-5.4"),
-        help="Step4b vision JSON audit for English listing vs image (required).",
+        default=os.getenv("GMI_COPY_REVIEW_ENGLISH_MODEL", "anthropic/claude-sonnet-4.6"),
+        help="Step4b vision JSON audit for English listing vs image (required). Default same family as --copy-review-french-model.",
     )
     parser.add_argument(
         "--copy-review-french-model",
@@ -4114,7 +4722,8 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default=None,
         help="UTF-8 file whose contents replace inline --user-image-instructions when the file exists.",
     )
-    args = parser.parse_args(argv)
+    argv_for_parser = None if argv is None else _normalize_embedded_argv(list(argv))
+    args = parser.parse_args(argv_for_parser)
     args.max_attempts = max(1, min(2, int(args.max_attempts)))
     skip_rev = (os.getenv("GMI_SKIP_LISTING_REVIEW") or "").strip().lower()
     if skip_rev in ("1", "true", "yes", "on"):
