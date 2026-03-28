@@ -47,6 +47,7 @@ from mtwi_ecommerce_pipeline import (  # noqa: E402
     extract_media_bytes_from_outcome,
     extract_media_url,
     path_to_data_url,
+    rq_image_generation_temperature,
 )
 
 try:
@@ -303,6 +304,7 @@ def run_rq_erase_with_mask(
         "image_url": image_data_url,
         "output_format": "png",
         "watermark": False,
+        "temperature": rq_image_generation_temperature(),
     }
     if mask_path.exists():
         mask_data_url = path_to_data_url(mask_path, force_png=True)
@@ -353,6 +355,7 @@ def run_harmonize_dual_image(
         "source_reference": orig_url,
         "output_format": "png",
         "watermark": False,
+        "temperature": rq_image_generation_temperature(),
     }
     try:
         outcome = rq.run_model(model=harmonize_model, payload=payload, timeout_s=timeout_s)

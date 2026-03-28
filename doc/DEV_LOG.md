@@ -4,6 +4,15 @@ Brief record of what changed and what was verified to work. _(Previously under `
 
 ## 2026-03-29
 
+### RQ 图像采样 temperature
+
+- **`rq_image_generation_temperature()`**（**`GMI_RQ_IMAGE_TEMPERATURE`**，默认 **0.65**）：**`RequestQueueClient.run_image_edit` / `run_image_variants`** 与 **`auto_text_erase_preprocess`** 的 RQ payload 统一带上 **`temperature`**，减轻同一输入反复出图「像素级雷同」；见 **CONFIGURATION.md**。
+
+### Streamlit：MTWI 标注可选
+
+- **`streamlit_app.py`**：增加 **「提供 MTWI 文本框标注」** 复选框（默认开启）。关闭时不写配套 `.txt`，流水线以 **`--input-image`** + 无 **`streamlit_item.<ext>.txt`** 走 **image-only**（与 `collect_input_items` 约定一致）。有标注时改为写入 **`txt_train/streamlit_item.<ext>.txt`**，与 **`--input-image`** 的配套文件名规则对齐。
+- **`README.md`**：试用步骤与上文一致。
+
 ### Request Queue HTTP 超时（扩展图 / 去字）
 
 - **`RequestQueueClient.run_model`**：`POST /requests` 不再固定 **`timeout=60`**；读超时默认随当次 **`timeout_s`**（与 **`GMI_IMAGE_TIMEOUT`** 一致的量级），避免大图提交时 **`ReadTimeout: read timeout=60`**。可选 **`GMI_RQ_HTTP_SUBMIT_TIMEOUT`**、**`GMI_RQ_POLL_READ_TIMEOUT`** 等（见 **CONFIGURATION.md**）。

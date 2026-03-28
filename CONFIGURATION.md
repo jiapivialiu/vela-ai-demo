@@ -73,6 +73,7 @@ GMI_EXTRA_IMAGES_SEEDREAM_USE_EDIT_FALLBACK
 GMI_EXTRA_IMAGES_SEEDREAM_BACKFILL_CAP
 GMI_RQ_OUTCOME_DEBUG
 GMI_RQ_OUTCOME_DEBUG_DEEP
+GMI_RQ_IMAGE_TEMPERATURE
 GMI_RQ_HTTP_SUBMIT_TIMEOUT
 GMI_RQ_HTTP_CONNECT_TIMEOUT
 GMI_RQ_POLL_READ_TIMEOUT
@@ -119,6 +120,7 @@ GMI_DEMO_USE_ENV_IMAGE_MODEL
 - **`GMI_EXTRA_IMAGES_DEBUG`**：设为 `1` / `true` / `on` 时，在 **`manifest.warnings`** 与 **stderr** 中记录扩展图相关 RQ 调用的 **prompt 长度、sha256 前 12 位、开头约 200 字符**，以及 **`returned_bytes`**（是否拿到图像字节）。用于确认每张扩展图是否使用了 **不同的完整 prompt**（若三张图仍相同，多半是 placeholder 复制而非单一 prompt）。
 - **`GMI_RQ_OUTCOME_DEBUG`**：设为 `1` / `true` / `on` 时，当 **`run_image_variants` / `run_image_edit`** 未解析出任何图像字节，在 **stderr** 打印一行 **`GMI RQ outcome debug […]`**：仅 **`outcome` 顶层**字段的**摘要**（子 dict 的 key 名列表前若干项、list 长度、字符串**前约 72 字符**等），**不是**完整 JSON，也**不**打印整段 base64。用于对照 GMI 控制台或补 **`extract_*_from_outcome`** 路径。
 - **`GMI_RQ_OUTCOME_DEBUG_DEEP`**：设为 `1` / `true` / `on` 时，在 **stderr** 额外打印 **`GMI RQ outcome debug-deep […]`**：**最多约 3 层**嵌套的 key / 类型 / 字符串 `len + head` 树（仍截断长串，不落盘完整图像数据）。可**单独**开启（不必同时开 `GMI_RQ_OUTCOME_DEBUG`），便于看清 Seedream 等返回的 `data` / `images` / `outputs` 结构。
+- **`GMI_RQ_IMAGE_TEMPERATURE`**：写入 **`run_image_edit` / `run_image_variants`** 及 **`auto_text_erase_preprocess`** 同源 RQ payload 的 **`temperature`**（浮点，**`[0, 2]`** 内截断）。默认 **不设置 = `0.65`**，同一原图多次修图时比未传参更易出**可见差异**；网关若忽略该字段则不影响调用。需要更稳或更飘可改为 **`0.3`**–**`0.9`** 等。
 
 **RQ 扩展图拿不到图、只能复制 final（`extra_images_placeholder`）时怎么排查**
 

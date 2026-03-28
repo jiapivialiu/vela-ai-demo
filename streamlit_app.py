@@ -2,9 +2,10 @@
 
 Flow (see ``main()``):
 
-1. User uploads image + MTWI ``.txt`` (or pastes lines); optional sidebar models / Mock.
-2. ``_write_run_inputs`` writes ``<run_dir>/image_train/streamlit_item.<ext>`` and
-   ``txt_train/streamlit_item.txt`` so ``collect_input_items`` directory-scan finds one SKU.
+1. User uploads image; MTWI ``.txt`` (or pasted lines) is optional via checkbox; optional sidebar models / Mock.
+2. ``_write_run_inputs`` writes ``<run_dir>/image_train/streamlit_item.<ext>`` and optionally
+   ``txt_train/streamlit_item.<ext>.txt`` (matches ``--input-image`` companion lookup in the pipeline).
+   Without a label file, the run is image-only (no MTWI quads).
 3. ``_build_streamlit_pipeline_argv`` returns **option-only** tokens for
    ``mtwi_ecommerce_pipeline.parse_args`` — **no** synthetic ``argv[0]`` program name.
    (``argparse.parse_args(list)`` parses the whole list as flags; a leading
@@ -46,8 +47,15 @@ _PIPELINE_ASYNC_KEY = "_streamlit_pipeline_async"
 _PIPELINE_RESULT_KEY = "_streamlit_pipeline_result"
 
 
-def _write_run_inputs(image_bytes: bytes, image_suffix: str, annotation_text: str, run_dir: Path) -> None:
-    """Save image + MTWI txt with matching stems (directory-scan mode)."""
+def _write_run_inputs(
+    image_bytes: bytes,
+    image_suffix: str,
+    run_dir: Path,
+    *,
+    annotation_text: str,
+    include_annotation: bool,
+) -> Path:
+    """Save image under image_train; optional MTWI txt as ``<same_filename>.txt`` for ``--input-image`` pairing."""
     img_dir = run_dir / "image_train"
     txt_dir = run_dir / "txt_train"
     img_dir.mkdir(parents=True, exist_ok=True)
@@ -55,11 +63,15 @@ def _write_run_inputs(image_bytes: bytes, image_suffix: str, annotation_text: st
     stem = "streamlit_item"
     img_path = img_dir / f"{stem}{image_suffix}"
     img_path.write_bytes(image_bytes)
-    (txt_dir / f"{stem}.txt").write_text(annotation_text.strip() + "\n", encoding="utf-8")
+    if include_annotation:
+        ann_path = txt_dir / f"{img_path.name}.txt"
+        ann_path.write_text(annotation_text.strip() + "\n", encoding="utf-8")
+    return img_path
 
 
 def _build_streamlit_pipeline_argv(
     run_dir: Path,
+    input_image: Path,
     mock: bool,
     extra_count: int,
     mask_mode: str,
@@ -93,6 +105,8 @@ def _build_streamlit_pipeline_argv(
     yaml_out = run_dir / "artifacts.yaml"
     deliv = run_dir / "deliverables"
     argv: list[str] = [
+        "--input-image",
+        str(input_image.resolve()),
         "--txt-dir",
         str(run_dir / "txt_train"),
         "--image-dir",
@@ -361,13 +375,21 @@ def main() -> None:
 
     st.subheader("1. 商品主图")
     up_img = st.file_uploader("上传图片（PNG / JPG / WebP）", type=["png", "jpg", "jpeg", "webp"])
-    st.subheader("2. 文本框标注（MTWI 每行：x1,y1,…,x4,y4,文本）")
-    up_txt = st.file_uploader("或上传 .txt", type=["txt"])
-    default_txt = ""
-    demo_txt_path = REPO_ROOT / "data/demo_one/txt_train/demo_item.txt"
-    if demo_txt_path.is_file():
-        default_txt = demo_txt_path.read_text(encoding="utf-8")
-    ann_text = st.text_area("标注内容", value=default_txt, height=220, placeholder="粘贴 MTWI 格式多行标注…")
+    st.subheader("2. 文本框标注（可选）")
+    provide_annotation = st.checkbox(
+        "提供 MTWI 文本框标注（四边形坐标 + 文本）",
+        value=True,
+        help="关闭后仅上传主图运行（无坐标蒙版；去字依赖模型按提示整图处理，流水线会记录 annotation_missing）。",
+    )
+    up_txt = None
+    ann_text = ""
+    if provide_annotation:
+        up_txt = st.file_uploader("或上传 .txt", type=["txt"])
+        default_txt = ""
+        demo_txt_path = REPO_ROOT / "data/demo_one/txt_train/demo_item.txt"
+        if demo_txt_path.is_file():
+            default_txt = demo_txt_path.read_text(encoding="utf-8")
+        ann_text = st.text_area("标注内容", value=default_txt, height=220, placeholder="粘贴 MTWI 格式多行标注…")
     st.subheader("3. 用户要求（可选）")
     user_copy = st.text_area("对 listing 文案的要求", height=80, placeholder="语气、长度、受众…")
     user_image = st.text_area("对图像处理 / 扩展图的要求", height=80, placeholder="背景、光线…")
@@ -410,22 +432,33 @@ def main() -> None:
             suf = Path(raw_name).suffix.lower()
             if suf not in {".png", ".jpg", ".jpeg", ".webp"}:
                 suf = ".jpg"
-            text_body = ann_text.strip()
-            if up_txt is not None:
-                text_body = up_txt.getvalue().decode("utf-8", errors="replace").strip()
-            if not text_body:
-                st.error("请填写或上传 MTWI 标注。")
-            else:
+            text_body = ""
+            can_run = True
+            if provide_annotation:
+                text_body = ann_text.strip()
+                if up_txt is not None:
+                    text_body = up_txt.getvalue().decode("utf-8", errors="replace").strip()
+                if not text_body:
+                    st.error("已开启「提供 MTWI 标注」：请填写或上传标注内容。")
+                    can_run = False
+            if can_run:
                 run_id = str(uuid.uuid4())[:12]
                 run_dir = REPO_ROOT / "outputs" / "streamlit_runs" / run_id
                 try:
-                    _write_run_inputs(up_img.getvalue(), suf, text_body, run_dir)
+                    img_path = _write_run_inputs(
+                        up_img.getvalue(),
+                        suf,
+                        run_dir,
+                        annotation_text=text_body if provide_annotation else "",
+                        include_annotation=provide_annotation,
+                    )
                 except OSError as exc:
                     st.error(f"写入临时文件失败: {exc}")
                 else:
                     prev_key = os.environ.get("GMI_API_KEY")
                     argv = _build_streamlit_pipeline_argv(
                         run_dir,
+                        img_path,
                         mock=mock,
                         extra_count=int(extra_image_count),
                         mask_mode=mask_mode,

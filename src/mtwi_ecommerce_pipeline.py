@@ -110,6 +110,21 @@ def _rq_poll_timeout_tuple() -> Tuple[float, float]:
     return (max(5.0, conn), max(15.0, read))
 
 
+def rq_image_generation_temperature() -> float:
+    """Sampling temperature for Request Queue image edit / variant payloads (higher → more diversity).
+
+    Override with **``GMI_RQ_IMAGE_TEMPERATURE``** (float, clamped to ``[0, 2]``). Default **0.65** balances
+    repeatability vs visibly different outputs when re-editing the same source image.
+    """
+    raw = (os.getenv("GMI_RQ_IMAGE_TEMPERATURE") or "").strip()
+    if raw:
+        try:
+            return max(0.0, min(2.0, float(raw)))
+        except ValueError:
+            pass
+    return 0.65
+
+
 class RequestQueueClient:
     """Generic Request Queue client for BRIA-style image editing models."""
 
@@ -191,6 +206,7 @@ class RequestQueueClient:
             "image_url": image_data_url,
             "output_format": "png",
             "watermark": False,
+            "temperature": rq_image_generation_temperature(),
         }
         if mask_image and mask_image.exists():
             mask_data_url = path_to_data_url(mask_image, force_png=True)
@@ -224,6 +240,7 @@ class RequestQueueClient:
             "max_images": count,
             "output_format": "png",
             "watermark": False,
+            "temperature": rq_image_generation_temperature(),
         }
         outcome = self.run_model(model=model, payload=payload, timeout_s=float(os.getenv("GMI_IMAGE_TIMEOUT", "300")))
         urls: List[str] = []
