@@ -133,4 +133,4 @@
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**输出物**：过程图、`mtwi_ecommerce_samples.yaml`；`--export-deliverables` 时含 **`description_en.md` / `description_fr.md` / `product_image.png` / `manifest.json`**；**`copy_review.md`**、**`locale_grammar_review.md`** 仅在 **未** `--skip-listing-review`（且未 `GMI_SKIP_LISTING_REVIEW=1`）时写入。扩展图 **`product_image_extra_*`** 仅在开启主链路扩展图或单独跑营销步骤时写入。命令行见 [src/README.md](src/README.md)；Prompt 见 [PROMPT_TUNING_NOTES.md](PROMPT_TUNING_NOTES.md)。
+**输出物**：过程图、`mtwi_ecommerce_samples.yaml`；`--export-deliverables` 时含 **`description_en.md` / `description_fr.md` / `product_image.png` / `manifest.json`**；**`copy_review.md`**、**`locale_grammar_review.md`** 仅在 **未** `--skip-listing-review`（且未 `GMI_SKIP_LISTING_REVIEW=1`）时写入。扩展图 **`product_image_extra_*`** 仅在开启主链路扩展图或单独跑营销步骤时写入。命令行见 [src/README.md](src/README.md)；Prompt 见 [PROMPT_TUNING_NOTES.md](doc/PROMPT_TUNING_NOTES.md)。
