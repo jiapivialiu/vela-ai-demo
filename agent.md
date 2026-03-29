@@ -84,7 +84,7 @@
 | **CLI** | `src/mtwi_ecommerce_pipeline.py` |
 | **批量** | `src/run_bulk_pipeline.py` + `configs/bulk_run*.yaml` |
 
-**共同输入**：商品主图；MTWI 每行 `X1,Y1,X2,Y2,X3,Y3,X4,Y4,文本`；可选 `--user-copy-instructions` / `--user-image-instructions`（及 file、`GMI_USER_*`）。
+**共同输入**：**必选**商品主图；**可选** MTWI 每行 `X1,Y1,X2,Y2,X3,Y3,X4,Y4,文本`（`--input-image` 且无同名配套 `.txt` 时为 image-only，见 `collect_input_items`）。**有标注时**：四边形参与蒙版去字（若开启擦除），且摘录文本进入 Step3/4 上下文，**英法 listing 文本生成通常更好**。**无标注时**：去字以整图语义 / 提示为主（蒙版为空），图像仍走同一 RQ 或 local 链路；**不将「是否带 MTWI」理解为对成图画质的单一决定因素**（策略不同，并非缺标注就不能出可用主图）。另可选 `--user-copy-instructions` / `--user-image-instructions`（及 file、`GMI_USER_*`）。
 
 ---
 
@@ -92,7 +92,8 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  输入：商品图 + MTWI 标注 + 可选用户偏好                         │
+│  输入：商品主图 + 〔可选〕 MTWI 标注 + 可选用户偏好              │
+│  （有标注 → OCR/摘录利文案；蒙版去字 vs 无底稿语义去字，图像链照常）  │
 └─────────────────────────┬───────────────────────────────────┘
                           ▼
 ┌─────────────────────────────────────────────────────────────┐
@@ -114,13 +115,16 @@
           ┌───────────────┴───────────────┐
           ▼                               ▼
 ┌─────────────────────┐       ┌─────────────────────────────┐
-│【Agent·必选】4b     │       │【Agent·必选】4c               │
-│ 英 / 法 文案质检     │       │ 两语言语法质检 **均为**        │
-│ **均为** Claude      │       │ `openai/gpt-5.4-nano`        │
+│【Agent·默认】4b      │       │【Agent·默认】4c               │
+│ 英 / 法 文案质检     │       │ 两语言语法质检（均为）         │
+│ 均为 Claude          │       │ `openai/gpt-5.4-nano`        │
 │ Sonnet 4.6 →        │       │ （英、法各 1 次文本 JSON）      │
 │ `anthropic/claude-  │       │                              │
-│  sonnet-4.6`        │       │                              │
+│  sonnet-4.6`        │       │ 与 4b 同一开关                 │
 │ （各 1 次视觉 JSON）  │       │                              │
+│ --skip-listing-     │       │                              │
+│ review 时 4b+4c     │       │                              │
+│ 俱不跑（非必选）     │       │                              │
 └──────────┬──────────┘       └──────────────┬──────────────┘
            └───────────────┬───────────────┘
                            ▼
@@ -129,4 +133,4 @@
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**输出物**：过程图、`mtwi_ecommerce_samples.yaml`；`--export-deliverables` 时含 **`description_en.md` / `description_fr.md` / `product_image.png` / `manifest.json`**、**`copy_review.md`**、**`locale_grammar_review.md`**；扩展图 **`product_image_extra_*`** 仅在开启主链路扩展图或单独跑营销步骤时写入。命令行见 [src/README.md](src/README.md)；Prompt 见 [PROMPT_TUNING_NOTES.md](PROMPT_TUNING_NOTES.md)。
+**输出物**：过程图、`mtwi_ecommerce_samples.yaml`；`--export-deliverables` 时含 **`description_en.md` / `description_fr.md` / `product_image.png` / `manifest.json`**；**`copy_review.md`**、**`locale_grammar_review.md`** 仅在 **未** `--skip-listing-review`（且未 `GMI_SKIP_LISTING_REVIEW=1`）时写入。扩展图 **`product_image_extra_*`** 仅在开启主链路扩展图或单独跑营销步骤时写入。命令行见 [src/README.md](src/README.md)；Prompt 见 [PROMPT_TUNING_NOTES.md](PROMPT_TUNING_NOTES.md)。
