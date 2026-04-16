@@ -2,6 +2,16 @@
 
 Brief record of what changed and what was verified to work. _(Previously under `misc/`; consolidated here in `doc/`.)_
 
+## 2026-04-16
+
+### Streamlit：MTWI 文本框位置输入改为可选（默认关闭）
+
+- **`streamlit_app.py`** 新增主表单开关 **「输入文本框位置（MTWI 标注）」**（默认 OFF），仅在开启时显示 `.txt` 上传与「标注内容」文本框，减少新用户对必填项的困惑。
+- 开关关闭时前端走 **image-only**：不再要求 MTWI 文本；运行参数增加 `--input-image`，允许后端按无标注路径处理。
+- 开关开启时保持原校验：必须填写或上传 MTWI 标注，否则阻止启动。
+- 输入落盘逻辑更新：`_write_run_inputs` 现在仅在提供标注时写 `txt_train/streamlit_item.txt`，并返回保存后的图片路径供 image-only 参数复用。
+- 本地验证：`python -m py_compile streamlit_app.py` 通过；并用临时目录脚本验证了开启/关闭两条路径的文件写入与 argv 生成行为。
+
 ## 2026-03-29
 
 ### Request Queue HTTP 超时（扩展图 / 去字）

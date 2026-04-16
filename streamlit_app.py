@@ -2,7 +2,7 @@
 
 Flow (see ``main()``):
 
-1. User uploads image + MTWI ``.txt`` (or pastes lines); optional sidebar models / Mock.
+1. User uploads image; optional MTWI ``.txt`` (or pasted lines) when annotation mode is enabled; optional sidebar models / Mock.
 2. ``_write_run_inputs`` writes ``<run_dir>/image_train/streamlit_item.<ext>`` and
    ``txt_train/streamlit_item.txt`` so ``collect_input_items`` directory-scan finds one SKU.
 3. ``_build_streamlit_pipeline_argv`` returns **option-only** tokens for
@@ -46,16 +46,19 @@ _PIPELINE_ASYNC_KEY = "_streamlit_pipeline_async"
 _PIPELINE_RESULT_KEY = "_streamlit_pipeline_result"
 
 
-def _write_run_inputs(image_bytes: bytes, image_suffix: str, annotation_text: str, run_dir: Path) -> None:
-    """Save image + MTWI txt with matching stems (directory-scan mode)."""
+def _write_run_inputs(image_bytes: bytes, image_suffix: str, annotation_text: str | None, run_dir: Path) -> Path:
+    """Save uploaded image and optional MTWI txt; return saved image path."""
     img_dir = run_dir / "image_train"
-    txt_dir = run_dir / "txt_train"
     img_dir.mkdir(parents=True, exist_ok=True)
-    txt_dir.mkdir(parents=True, exist_ok=True)
     stem = "streamlit_item"
     img_path = img_dir / f"{stem}{image_suffix}"
     img_path.write_bytes(image_bytes)
-    (txt_dir / f"{stem}.txt").write_text(annotation_text.strip() + "\n", encoding="utf-8")
+    cleaned_annotation = (annotation_text or "").strip()
+    if cleaned_annotation:
+        txt_dir = run_dir / "txt_train"
+        txt_dir.mkdir(parents=True, exist_ok=True)
+        (txt_dir / f"{stem}.txt").write_text(cleaned_annotation + "\n", encoding="utf-8")
+    return img_path
 
 
 def _build_streamlit_pipeline_argv(
@@ -86,6 +89,7 @@ def _build_streamlit_pipeline_argv(
     annotation_audit_model: str,
     erase_strategy: str,
     copy_understand_image: str,
+    input_image_path: str | None = None,
     skip_listing_review: bool = False,
 ) -> list[str]:
     """CLI tokens for ``parse_args`` only — first element must be ``--...``, not a program name."""
@@ -143,6 +147,8 @@ def _build_streamlit_pipeline_argv(
     ]
     if erase_strategy == "model":
         argv.extend(["--eraser-model", additional_model])
+    if input_image_path:
+        argv.extend(["--input-image", input_image_path])
     if mock:
         argv.append("--mock")
     if extra_count <= 0:
@@ -266,66 +272,63 @@ def _render_deliverables(run_dir: Path) -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Vela AI Demo — MTWI 链路", layout="wide")
-    st.title("MTWI 商品图 → 去字 / 文案 / 交付包")
+    st.set_page_config(page_title="Vela AI — 电商出海素材生成", layout="wide")
+    st.title("Vela AI 电商出海助手")
     st.caption(
-        "中文标注输入；用户可见文案为加拿大英语 / 法语。侧栏可切换 Mock、模型；**额外营销图**见下方 **第 4 步**（默认不生成；亦可跑完后用 `src/run_marketing_extras_step.py` 补图）。"
+        "上传中文商品图，自动去除文字水印、生成加拿大英语 / 法语商品描述与参数，一键产出跨境电商上架素材包。"
+        " 侧栏可切换运行模式与模型配置。"
     )
 
     with st.sidebar:
-        st.header("运行模式")
-        mock = st.checkbox("Mock 模式（不调 GMI）", value=False)
-        api_key = st.text_input("GMI API Key（可选，覆盖环境变量）", type="password", value="")
-        st.header("图像与去字")
-        mask_mode = st.selectbox(
-            "Mask 模式（txt 四边形 → 蒙版擦除）",
-            ["all", "overlay"],
-            index=0,
-            help="推荐 all：按标注全部擦除。overlay 依赖在线 VLM/中文启发式筛选；Mock+英文标注曾出现 0 框导致图不变。",
-        )
-        harmonize = st.checkbox("去字后模型 harmonize（融合擦除边缘）", value=True)
-        annotation_audit = st.checkbox(
-            "标注审核 Agent（真实模式：先 VLM 判断每框是否可用、是否需擦除）",
-            value=True,
-            help="Mock 下自动跳过。关闭则仅用 Mask 模式（all/overlay）选框。",
-        )
-        disable_restore = st.checkbox("跳过 step2 画质修复", value=False)
-        erase_strategy = st.selectbox(
-            "去字方式",
-            ["model", "local"],
-            index=0,
-            help="model = 侧栏「RQ 去字模型」的 Request Queue（默认）；local = 本地白底+inpaint，不调去字 RQ。",
-        )
-        copy_understand_image = st.selectbox(
-            "文案理解用图（Step3，在生成英法描述前）",
-            ["final", "extra1", "source"],
-            index=0,
-            help="final=修复后主图（默认，避开水印原图）；extra1=先出第1张营销图并经与原图一致性审核后再理解；source=原始上架图。",
-        )
-        additional_image_model = st.text_input(
-            "RQ 去字模型（erase=model 时）",
-            value=os.getenv("GMI_ADDITIONAL_IMAGE_MODEL", "seedream-5.0-lite"),
-            help="与主表单「第 4 步」开启额外营销图时使用的扩展图模型相同（`--additional-image-model` / `--eraser-model`）。",
-        )
-        st.header("文案")
-        copy_mode = st.selectbox("Step4 模式", ["unified", "split"], index=0)
-        skip_listing_review = st.checkbox(
-            "跳过 Step4b/4c 质检（仅生成英法描述与参数）",
-            value=False,
-            help="不调 copy review / locale grammar；交付包不含 copy_review.md 与 locale_grammar_review.md。",
-        )
-        max_attempts = st.number_input(
-            "每步最大重试",
-            min_value=1,
-            max_value=2,
-            value=2,
-            help="与 CLI 一致：`mtwi_ecommerce_pipeline` 会将该值限制在 1–2。",
-        )
+        mock = st.checkbox("Mock 模式（离线测试，不调用 API）", value=False)
+        api_key = st.text_input("GMI API Key", type="password", value="")
 
-        with st.expander("模型 ID（高级）"):
+        with st.expander("高级设置", expanded=False):
+            st.markdown("**图像处理**")
+            mask_mode = st.selectbox(
+                "蒙版模式",
+                ["all", "overlay"],
+                index=0,
+                help="all：擦除所有标注框内文字（推荐）。overlay：仅擦除水印 / 促销文字，保留商品自身印刷文字。",
+            )
+            harmonize = st.checkbox("去字后融合修复", value=True, help="对擦除区域做模型级边缘融合，减少痕迹。")
+            annotation_audit = st.checkbox(
+                "标注审核",
+                value=True,
+                help="真实模式下先用 VLM 判断每个标注框是否有效、是否需要擦除。Mock 下自动跳过。",
+            )
+            disable_restore = st.checkbox("跳过画质修复", value=False)
+            erase_strategy = st.selectbox(
+                "去字方式",
+                ["model", "local"],
+                index=0,
+                help="model：云端模型去字（推荐）。local：本地 OpenCV 去字，不消耗 API 额度。",
+            )
+            copy_understand_image = st.selectbox(
+                "文案理解用图",
+                ["final", "extra1", "source"],
+                index=0,
+                help="final：修复后主图（推荐）。source：原始上架图。extra1：先生成第 1 张营销图再理解。",
+            )
+            additional_image_model = st.text_input(
+                "图像模型 ID",
+                value=os.getenv("GMI_ADDITIONAL_IMAGE_MODEL", "seedream-5.0-lite"),
+                help="用于去字与营销图生成的 Request Queue 模型。",
+            )
+
+            st.markdown("**文案生成**")
+            copy_mode = st.selectbox("生成模式", ["unified", "split"], index=0, help="unified：单次生成双语文案（推荐）。split：分步生成。")
+            skip_listing_review = st.checkbox(
+                "跳过文案质检",
+                value=False,
+                help="跳过 copy review 与 locale grammar 检查，交付包中不含质检报告。",
+            )
+            max_attempts = st.number_input("每步最大重试", min_value=1, max_value=2, value=2)
+
+            st.markdown("**模型 ID**")
             vision_model = st.text_input("VLM", value=os.getenv("GMI_VISION_MODEL", "Qwen/Qwen3-VL-235B"))
             annotation_audit_model = st.text_input(
-                "标注审核 VLM（空 = 与上栏相同）",
+                "标注审核 VLM（空 = 同上）",
                 value=os.getenv("GMI_ANNOTATION_AUDIT_MODEL", ""),
             )
             unified_model = st.text_input(
@@ -344,7 +347,7 @@ def main() -> None:
                 value=os.getenv("GMI_SIMPLE_COPY_MODEL")
                 or os.getenv("GMI_FALLBACK_ENGLISH_COPY_MODEL", "openai/gpt-5.4-mini"),
             )
-            no_simple_recovery = st.checkbox("关闭 simple bilingual recovery", value=False)
+            no_simple_recovery = st.checkbox("关闭 simple recovery", value=False)
             cr_en = st.text_input(
                 "Copy review EN",
                 value=os.getenv("GMI_COPY_REVIEW_ENGLISH_MODEL", "anthropic/claude-sonnet-4.6"),
@@ -359,67 +362,95 @@ def main() -> None:
                 "Locale grammar FR", value=os.getenv("GMI_LOCALE_GRAMMAR_FRENCH_MODEL", "openai/gpt-5.4-nano")
             )
 
-    st.subheader("1. 商品主图")
-    up_img = st.file_uploader("上传图片（PNG / JPG / WebP）", type=["png", "jpg", "jpeg", "webp"])
-    st.subheader("2. 文本框标注（MTWI 每行：x1,y1,…,x4,y4,文本）")
-    up_txt = st.file_uploader("或上传 .txt", type=["txt"])
-    default_txt = ""
-    demo_txt_path = REPO_ROOT / "data/demo_one/txt_train/demo_item.txt"
-    if demo_txt_path.is_file():
-        default_txt = demo_txt_path.read_text(encoding="utf-8")
-    ann_text = st.text_area("标注内容", value=default_txt, height=220, placeholder="粘贴 MTWI 格式多行标注…")
-    st.subheader("3. 用户要求（可选）")
-    user_copy = st.text_area("对 listing 文案的要求", height=80, placeholder="语气、长度、受众…")
-    user_image = st.text_area("对图像处理 / 扩展图的要求", height=80, placeholder="背景、光线…")
+    st.subheader("上传商品图")
+    up_img = st.file_uploader("选择图片文件（PNG / JPG / WebP）", type=["png", "jpg", "jpeg", "webp"])
 
-    st.subheader("4. 额外营销图（可选）")
-    st.caption(
-        "默认不生成。开启后会在本轮流水线内调用 Request Queue 产出 `product_image_extra_*.png`（耗时与费用更高）。"
-        " 若只需主图与文案，可保持关闭，完成后在终端运行 `python src/run_marketing_extras_step.py`（见 src/README.md）。"
-    )
-    generate_extra_marketing = st.checkbox(
-        "在本轮运行中生成额外营销图",
+    st.divider()
+    st.subheader("可选设置")
+
+    use_mtwi_annotations = st.checkbox(
+        "提供文字区域标注（可提升去字精度）",
         value=False,
-        help="等价于 CLI：`--generate-additional-images` + `--additional-image-count`。",
+        help="开启后可上传或粘贴 MTWI 格式的文字框坐标，帮助模型更精准地定位并擦除图上文字。关闭则以 image-only 模式运行。",
+    )
+    up_txt = None
+    ann_text = ""
+    if use_mtwi_annotations:
+        up_txt = st.file_uploader("上传标注文件（.txt）", type=["txt"])
+        ann_text = st.text_area(
+            "或直接粘贴标注内容",
+            height=150,
+            placeholder="每行一个文字框，格式：x1,y1,x2,y2,x3,y3,x4,y4,文本\n例如：100,200,400,200,400,250,100,250,限时特价",
+        )
+
+    use_custom_instructions = st.checkbox(
+        "自定义生成要求",
+        value=False,
+        help="对文案风格或图像处理提出额外要求，例如语气、受众、背景风格等。",
+    )
+    user_copy = ""
+    user_image = ""
+    if use_custom_instructions:
+        user_copy = st.text_area("对商品描述文案的要求", height=80, placeholder="例如：语气活泼、面向年轻女性、突出性价比…")
+        user_image = st.text_area("对图像处理的要求", height=80, placeholder="例如：保持白色背景、提亮光线…")
+
+    generate_extra_marketing = st.checkbox(
+        "生成额外营销图",
+        value=False,
+        help="额外产出多角度 / 场景化商品图（耗时与费用更高）。关闭时仅输出主图与文案。",
     )
     extra_image_count = 0
     if generate_extra_marketing:
         extra_image_count = st.number_input(
-            "额外营销图张数",
+            "营销图张数",
             min_value=1,
             max_value=6,
             value=3,
             step=1,
-            help="写入交付目录的 `product_image_extra_1.png` … 序号连续。",
         )
 
+    st.divider()
+
     processing = _PIPELINE_ASYNC_KEY in st.session_state
+    has_image = up_img is not None
 
     if processing:
         st.warning("**正在处理中** — 下方显示实时步骤。请勿关闭页面，完成后会自动刷新。")
 
-    start_clicked = st.button("开始处理", type="primary", disabled=processing)
+    start_clicked = st.button(
+        "开始处理",
+        type="primary",
+        disabled=(not has_image or processing),
+        help="请先上传商品图" if not has_image else None,
+    )
 
     if start_clicked:
         if not mock and not (api_key.strip() or os.getenv("GMI_API_KEY", "").strip()):
             st.error("真实模式需要 GMI API Key：在侧栏填写或终端 `export GMI_API_KEY=...`，或勾选 Mock。")
-        elif not up_img:
-            st.error("请先上传商品主图。")
         else:
             raw_name = up_img.name or "upload.jpg"
             suf = Path(raw_name).suffix.lower()
             if suf not in {".png", ".jpg", ".jpeg", ".webp"}:
                 suf = ".jpg"
-            text_body = ann_text.strip()
-            if up_txt is not None:
-                text_body = up_txt.getvalue().decode("utf-8", errors="replace").strip()
-            if not text_body:
-                st.error("请填写或上传 MTWI 标注。")
-            else:
+            text_body = ""
+            validation_error = False
+            if use_mtwi_annotations:
+                text_body = ann_text.strip()
+                if up_txt is not None:
+                    text_body = up_txt.getvalue().decode("utf-8", errors="replace").strip()
+                if not text_body:
+                    st.error("已开启文字区域标注，但内容为空。请粘贴标注内容或上传 .txt 文件。")
+                    validation_error = True
+            if not validation_error:
                 run_id = str(uuid.uuid4())[:12]
                 run_dir = REPO_ROOT / "outputs" / "streamlit_runs" / run_id
                 try:
-                    _write_run_inputs(up_img.getvalue(), suf, text_body, run_dir)
+                    saved_image = _write_run_inputs(
+                        up_img.getvalue(),
+                        suf,
+                        text_body if use_mtwi_annotations else None,
+                        run_dir,
+                    )
                 except OSError as exc:
                     st.error(f"写入临时文件失败: {exc}")
                 else:
@@ -452,6 +483,7 @@ def main() -> None:
                         annotation_audit_model=annotation_audit_model,
                         erase_strategy=erase_strategy,
                         copy_understand_image=copy_understand_image,
+                        input_image_path=str(saved_image) if not use_mtwi_annotations else None,
                         skip_listing_review=skip_listing_review,
                     )
                     st.session_state[_PIPELINE_ASYNC_KEY] = {
